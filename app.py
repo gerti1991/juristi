@@ -13,6 +13,8 @@ from datetime import datetime
 from scraper import AlbanianLegalScraper
 from ai import CloudLLMClient
 from dotenv import load_dotenv
+import google.generativeai as genai
+from typing import List, Dict, Optional
 
 # Load environment variables
 load_dotenv()
@@ -23,24 +25,32 @@ os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 class CloudEnhancedAlbanianLegalRAG:
     def __init__(self):
-        """Initialize the cloud-enhanced RAG system with environment variables"""
-        self.model_name = 'all-MiniLM-L6-v2'
+        """Initialize the cloud-enhanced RAG system with Google embeddings"""
+        # Embedding configuration
+        self.use_google_embeddings = True
+        self.model_name = 'all-MiniLM-L6-v2'  # Fallback model
         self.model = None
+        self.gemini_api_key = None
+        
+        # Document storage
         self.legal_documents = []
         self.document_embeddings = None
         self.scraper = AlbanianLegalScraper(max_docs=10)
         self.cloud_llm = None
         
         # Configuration from environment variables
-        self.similarity_threshold = float(os.getenv('SIMILARITY_THRESHOLD', '0.08'))
+        self.similarity_threshold = float(os.getenv('SIMILARITY_THRESHOLD', '0.15'))
         self.max_context_length = int(os.getenv('MAX_CONTEXT_LENGTH', '4000'))
         self.max_chunks_to_return = int(os.getenv('MAX_CHUNKS_TO_RETURN', '5'))
         
         # Cache file for embeddings
-        self.embeddings_cache_file = 'document_embeddings_cache.json'
+        self.embeddings_cache_file = 'document_embeddings_cache_google.json'
         
-        # Load model with error handling
-        self._load_model()
+        # Initialize Google API
+        self._setup_google_api()
+        
+        # Load fallback model if needed
+        self._load_fallback_model()
         
         # Initialize cloud LLM
         self._load_cloud_llm()
@@ -51,22 +61,94 @@ class CloudEnhancedAlbanianLegalRAG:
         # Generate embeddings
         self._generate_embeddings()
     
-    def _load_model(self):
-        """Load the sentence transformer model with error handling"""
+    def _setup_google_api(self):
+        """Setup Google API for embeddings"""
         try:
-            st.info("🔄 Loading AI model...")
-            self.model = SentenceTransformer(self.model_name)
-            st.success("✅ AI model loaded successfully!")
+            self.gemini_api_key = os.getenv("GEMINI_API_KEY")
+            if self.gemini_api_key:
+                genai.configure(api_key=self.gemini_api_key)
+                st.info("🔄 Google API configured for embeddings...")
+                self.use_google_embeddings = True
+                st.success("✅ Google embeddings enabled!")
+            else:
+                st.warning("⚠️ GEMINI_API_KEY not found - using local embeddings")
+                self.use_google_embeddings = False
         except Exception as e:
-            st.error(f"❌ Error loading model: {e}")
-            st.info("Please ensure sentence-transformers is installed: pip install sentence-transformers")
-            self.model = None
+            st.error(f"❌ Error setting up Google API: {e}")
+            self.use_google_embeddings = False
+    
+    def _load_fallback_model(self):
+        """Load the local sentence transformer model as fallback"""
+        if not self.use_google_embeddings:
+            try:
+                st.info("🔄 Loading local AI model...")
+                self.model = SentenceTransformer(self.model_name)
+                st.success("✅ Local AI model loaded successfully!")
+            except Exception as e:
+                st.error(f"❌ Error loading local model: {e}")
+                st.info("Please ensure sentence-transformers is installed: pip install sentence-transformers")
+                self.model = None
+
+    def _get_google_embeddings(self, texts: List[str]) -> Optional[np.ndarray]:
+        """Get embeddings using Google's embedding-001 model"""
+        if not self.use_google_embeddings:
+            return None
+            
+        try:
+            # Use Google's text-embedding-004 model (latest and best)
+            embeddings = []
+            batch_size = 100  # Process in batches to avoid rate limits
+            
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                
+                # Get embeddings for this batch
+                result = genai.embed_content(
+                    model="models/text-embedding-004",
+                    content=batch,
+                    task_type="retrieval_document"  # Optimized for document retrieval
+                )
+                
+                # Extract embeddings from result
+                if hasattr(result, 'embedding'):
+                    # Single text
+                    embeddings.append(result['embedding'])
+                else:
+                    # Multiple texts
+                    for embedding in result['embedding']:
+                        embeddings.append(embedding)
+            
+            return np.array(embeddings)
+            
+        except Exception as e:
+            st.error(f"❌ Google embeddings error: {e}")
+            st.info("Falling back to local embeddings...")
+            self.use_google_embeddings = False
+            return None
+
+    def _get_google_query_embedding(self, query: str) -> Optional[np.ndarray]:
+        """Get embedding for a query using Google's model"""
+        if not self.use_google_embeddings:
+            return None
+            
+        try:
+            result = genai.embed_content(
+                model="models/text-embedding-004",
+                content=query,
+                task_type="retrieval_query"  # Optimized for query embedding
+            )
+            
+            return np.array([result['embedding']])
+            
+        except Exception as e:
+            st.error(f"❌ Google query embedding error: {e}")
+            return None
     
     def _load_cloud_llm(self):
         """Initialize cloud LLM client"""
         try:
             st.info("🌐 Connecting to cloud LLM...")
-            self.cloud_llm = CloudLLMClient("groq")
+            self.cloud_llm = CloudLLMClient("gemini")  # Changed to Gemini as default
             
             if self.cloud_llm.api_key:
                 st.success("✅ Cloud LLM connected successfully!")
@@ -207,15 +289,18 @@ class CloudEnhancedAlbanianLegalRAG:
     
     def _load_embeddings_cache(self):
         """Load cached embeddings if available"""
-        if os.path.exists(self.embeddings_cache_file):
+        cache_file = self.embeddings_cache_file if self.use_google_embeddings else 'document_embeddings_cache_local.json'
+        
+        if os.path.exists(cache_file):
             try:
-                with open(self.embeddings_cache_file, 'r', encoding='utf-8') as f:
+                with open(cache_file, 'r', encoding='utf-8') as f:
                     cache = json.load(f)
                 
-                # Check if cache is still valid (same number of documents)
-                if cache.get('document_count') == len(self.legal_documents):
+                # Check if cache is still valid
+                if (cache.get('document_count') == len(self.legal_documents) and 
+                    cache.get('embedding_type') == ('google' if self.use_google_embeddings else 'local')):
                     self.document_embeddings = np.array(cache['embeddings'])
-                    st.success("✅ Loaded cached embeddings")
+                    st.success(f"✅ Loaded cached {'Google' if self.use_google_embeddings else 'local'} embeddings")
                     return True
             except Exception as e:
                 st.warning(f"⚠️ Could not load embedding cache: {e}")
@@ -225,23 +310,26 @@ class CloudEnhancedAlbanianLegalRAG:
     def _save_embeddings_cache(self):
         """Save embeddings to cache"""
         try:
+            cache_file = self.embeddings_cache_file if self.use_google_embeddings else 'document_embeddings_cache_local.json'
+            
             cache = {
                 'embeddings': self.document_embeddings.tolist(),
                 'document_count': len(self.legal_documents),
+                'embedding_type': 'google' if self.use_google_embeddings else 'local',
                 'created_at': datetime.now().isoformat()
             }
             
-            with open(self.embeddings_cache_file, 'w', encoding='utf-8') as f:
+            with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cache, f)
                 
-            st.success("✅ Embeddings cached for faster loading")
+            st.success(f"✅ {'Google' if self.use_google_embeddings else 'Local'} embeddings cached for faster loading")
         except Exception as e:
             st.warning(f"⚠️ Could not save embedding cache: {e}")
     
     def _generate_embeddings(self):
-        """Generate embeddings for all documents"""
-        if not self.model:
-            st.error("❌ Model not loaded - cannot generate embeddings")
+        """Generate embeddings for all documents using Google or local model"""
+        if not self.use_google_embeddings and not self.model:
+            st.error("❌ No embedding model available - cannot generate embeddings")
             return
         
         if not self.legal_documents:
@@ -253,37 +341,77 @@ class CloudEnhancedAlbanianLegalRAG:
             return
         
         try:
-            st.info("🔄 Generating document embeddings...")
-            
-            # Combine Albanian and English content for better matching
-            document_texts = []
-            for doc in self.legal_documents:
-                combined_text = f"{doc['content']} {doc.get('content_en', '')}"
-                document_texts.append(combined_text)
-            
-            # Generate embeddings
-            self.document_embeddings = self.model.encode(document_texts)
-            
-            # Save to cache
-            self._save_embeddings_cache()
-            
-            st.success(f"✅ Generated embeddings for {len(self.legal_documents)} documents")
+            if self.use_google_embeddings:
+                st.info("🔄 Generating Google embeddings for better Albanian legal search...")
+                
+                # Prepare document texts with enhanced content
+                document_texts = []
+                for doc in self.legal_documents:
+                    # Combine title and content for better context
+                    enhanced_text = f"Dokument ligjor: {doc['title']}. Përmbajtja: {doc['content']}"
+                    if doc.get('content_en'):
+                        enhanced_text += f" English: {doc['content_en']}"
+                    document_texts.append(enhanced_text)
+                
+                # Generate embeddings using Google's model
+                self.document_embeddings = self._get_google_embeddings(document_texts)
+                
+                if self.document_embeddings is not None:
+                    self._save_embeddings_cache()
+                    st.success(f"✅ Generated Google embeddings for {len(self.legal_documents)} documents")
+                else:
+                    raise Exception("Failed to generate Google embeddings")
+                    
+            else:
+                # Fallback to local embeddings
+                st.info("🔄 Generating local embeddings...")
+                
+                document_texts = []
+                for doc in self.legal_documents:
+                    combined_text = f"{doc['content']} {doc.get('content_en', '')}"
+                    document_texts.append(combined_text)
+                
+                self.document_embeddings = self.model.encode(document_texts)
+                self._save_embeddings_cache()
+                st.success(f"✅ Generated local embeddings for {len(self.legal_documents)} documents")
             
         except Exception as e:
             st.error(f"❌ Error generating embeddings: {e}")
-            self.document_embeddings = None
+            
+            # Try fallback to local model if Google fails
+            if self.use_google_embeddings and self.model:
+                st.info("🔄 Trying local embeddings as fallback...")
+                try:
+                    self.use_google_embeddings = False
+                    self._generate_embeddings()
+                except Exception as fallback_error:
+                    st.error(f"❌ Fallback also failed: {fallback_error}")
+                    self.document_embeddings = None
     
     def search_documents(self, query: str, top_k: int = 3):
-        """Search for relevant documents using semantic similarity with Albanian query enhancement"""
-        if not self.model or self.document_embeddings is None:
+        """Search for relevant documents using semantic similarity with Google or local embeddings"""
+        if self.document_embeddings is None:
             return []
         
         try:
             # Enhance Albanian queries for better semantic search
             enhanced_query = self._enhance_albanian_query(query)
             
-            # Generate query embedding
-            query_embedding = self.model.encode([enhanced_query])
+            # Generate query embedding using appropriate method
+            if self.use_google_embeddings:
+                query_embedding = self._get_google_query_embedding(enhanced_query)
+                if query_embedding is None:
+                    # Fallback to local model if available
+                    if self.model:
+                        query_embedding = self.model.encode([enhanced_query])
+                    else:
+                        st.error("❌ No embedding method available for query")
+                        return []
+            else:
+                if not self.model:
+                    st.error("❌ Local model not loaded")
+                    return []
+                query_embedding = self.model.encode([enhanced_query])
             
             # Calculate similarities
             similarities = cosine_similarity(query_embedding, self.document_embeddings)[0]
@@ -293,11 +421,22 @@ class CloudEnhancedAlbanianLegalRAG:
             
             results = []
             max_similarity = 0
+            
+            # Find the maximum similarity to make adaptive threshold decisions
             for idx in top_indices:
                 similarity = float(similarities[idx])
                 if similarity > max_similarity:
                     max_similarity = similarity
-                if similarity > self.similarity_threshold:  # Configurable threshold for Albanian queries
+                
+                # Use adaptive threshold with improved settings for Google embeddings
+                base_threshold = self.similarity_threshold
+                if self.use_google_embeddings:
+                    # Google embeddings have different scale, adjust threshold
+                    base_threshold = max(0.1, self.similarity_threshold * 0.8)
+                
+                adaptive_threshold = max(base_threshold, max_similarity * 0.7) if max_similarity > 0.2 else base_threshold
+                
+                if similarity > adaptive_threshold or (len(results) == 0 and idx == top_indices[0] and similarity > 0.1):
                     doc = self.legal_documents[idx].copy()
                     doc['similarity'] = similarity
                     results.append(doc)
@@ -312,27 +451,113 @@ class CloudEnhancedAlbanianLegalRAG:
             return []
     
     def _enhance_albanian_query(self, query: str) -> str:
-        """Enhance Albanian queries with synonyms and related terms"""
-        enhanced_query = query
+        """Enhance Albanian queries with comprehensive legal synonyms and context"""
+        enhanced_query = query.lower()
         
-        # Add Albanian legal synonyms
+        # Comprehensive Albanian legal synonyms for better semantic matching
         legal_synonyms = {
-            'pushim': 'pushim leaves vacation dit',
-            'punë': 'punë work employment job',
-            'ligj': 'ligj law legal kod',
-            'sanksion': 'sanksion penalty dënim gjobë',
-            'kompani': 'kompani company business shoqëri',
-            'kontrata': 'kontrata contract marrëveshje',
-            'vjedhje': 'vjedhje theft stealing',
-            'martesë': 'martesë marriage bashkëshort',
-            'divorcë': 'divorcë divorce ndarje'
+            # Employment & Labor Law
+            'punë': 'punë work employment job labor pune punim',
+            'pagë': 'pagë salary wage rrogë compensation pagesë',
+            'rrogë': 'rrogë salary wage pagë income të ardhura',
+            'minimum': 'minimum minim minimale lowest më të ulët bazë',
+            'pushim': 'pushim vacation leave holiday pushimi ditë',
+            'punëtor': 'punëtor employee worker staff punonjës',
+            'punëdhënës': 'punëdhënës employer boss company kompani',
+            
+            # Criminal Law - Enhanced for better matching
+            'dënim': 'dënim punishment penalty sanksion gjykim burgim gjoba',
+            'denimi': 'denimi punishment penalty sanksion gjykim burgim gjoba',
+            'plagosje': 'plagosje injury wound attack assault sulm dhunë',
+            'plagos': 'plagos injure wound attack assault sulm dhunë',
+            'armë': 'armë weapon tool vegël instrument mjete ftohtë',
+            'arme': 'arme weapon tool vegël instrument mjete ftohtë',
+            'ftohtë': 'ftohtë cold steel metalike hekur thikë',
+            'vjedhje': 'vjedhje theft stealing robbery grabitje marrje',
+            'sanksion': 'sanksion penalty punishment dënim gjobë burgim',
+            'gjobë': 'gjobë fine penalty sanksion dënim financiar',
+            'krim': 'krim crime criminal penal vepër penale kundërvajtje',
+            'penal': 'penal criminal crime kod ligj sanksion dënim',
+            'burgim': 'burgim prison jail detention arrest paraburgim',
+            'vrasje': 'vrasje murder killing homicide vdekje ekzekutim',
+            'dhunë': 'dhunë violence force brutality aggression sulm',
+            'sulm': 'sulm attack assault agression dhunë',
+            
+            # Business & Commercial Law
+            'kompani': 'kompani company business shoqëri enterprise biznes',
+            'biznes': 'biznes business company kompani shoqëri tregtare',
+            'regjistroj': 'regjistroj register establish themelon krijoj',
+            'shoqëri': 'shoqëri company business enterprise kompani',
+            'tregtare': 'tregtare commercial business trading biznes',
+            
+            # Family Law
+            'martesë': 'martesë marriage wedding bashkëshort familje',
+            'divorcë': 'divorcë divorce separation ndarje',
+            'fëmijë': 'fëmijë child children kids të mitur',
+            'familje': 'familje family household shtëpi',
+            'prindër': 'prindër parents mother father',
+            
+            # Civil Law
+            'kontrata': 'kontrata contract agreement marrëveshje',
+            'pronë': 'pronë property asset pasuri',
+            'të drejta': 'të drejta rights legal ligjore',
+            'detyrim': 'detyrim obligation duty responsibility',
+            
+            # General Legal Terms
+            'ligj': 'ligj law legal kod juridik ligjor',
+            'kod': 'kod code law ligj juridik',
+            'juridik': 'juridik legal law ligj ligjor',
+            'gjykatë': 'gjykatë court tribunal drejtësi',
+            'avokat': 'avokat lawyer attorney jurist',
+            
+            # Tax & Finance
+            'taksë': 'taksë tax duty detyrim tatim',
+            'tatim': 'tatim tax taksë detyrim financiar',
+            
+            # Constitutional & Administrative
+            'kushtetutë': 'kushtetutë constitution basic law',
+            'shtet': 'shtet state government qeveri',
+            'administrativ': 'administrativ administrative government publik'
         }
         
+        # Add relevant synonyms to enhance query
         for albanian_term, synonyms in legal_synonyms.items():
-            if albanian_term in query.lower():
+            if albanian_term in enhanced_query:
                 enhanced_query += f" {synonyms}"
         
+        # Add legal context keywords based on query type
+        if any(word in enhanced_query for word in ['sa', 'how much', 'shumë', 'amount']):
+            enhanced_query += " sasi amount vlerë"
+        
+        if any(word in enhanced_query for word in ['si', 'how', 'procedura', 'process']):
+            enhanced_query += " procedurë process hapa steps"
+        
+        if any(word in enhanced_query for word in ['çfarë', 'what', 'cilat', 'which']):
+            enhanced_query += " përkufizim definition detaje specifics"
+        
         return enhanced_query
+    
+    def search_legal_documents(self, query: str) -> str:
+        """Main interface method for searching and responding to legal queries"""
+        try:
+            # Search for relevant documents
+            relevant_docs = self.search_documents(query, top_k=self.max_chunks_to_return)
+            
+            # Generate comprehensive response
+            response = self.generate_response(query, relevant_docs)
+            
+            return response
+            
+        except Exception as e:
+            st.error(f"❌ Search error: {e}")
+            return f"❌ **Gabim në kërkim**: {e}\n\n⚖️ Ju lutem provoni përsëri ose kontaktoni një jurist."
+    
+    def _find_similar_documents(self, query: str, top_k: int = 5):
+        """Find similar documents - wrapper around search_documents for compatibility"""
+        docs = self.search_documents(query, top_k)
+        
+        # Return in the format expected by test files: (doc, similarity) tuples
+        return [(doc, doc.get('similarity', 0.0)) for doc in docs]
     
     def generate_response(self, query: str, relevant_docs: list) -> str:
         """Generate a comprehensive response using cloud LLM or fallback"""
@@ -348,27 +573,279 @@ class CloudEnhancedAlbanianLegalRAG:
             return self._fallback_response(query, relevant_docs)
     
     def _fallback_response(self, query: str, relevant_docs: list) -> str:
-        """Fallback response when cloud LLM is not available"""
-        if not relevant_docs:
-            return self._get_no_results_response()
+        """Enhanced fallback response with intelligent general legal knowledge"""
         
-        # Check for vacation-related queries
-        vacation_keywords = ['pushim', 'pushimi', 'vacation', 'leave', 'dit']
-        if any(keyword in query.lower() for keyword in vacation_keywords):
-            return self._get_vacation_response(relevant_docs)
+        # If we have relevant documents with decent similarity, use them
+        if relevant_docs and any(doc.get('similarity', 0) > 0.3 for doc in relevant_docs):
+            return self._generate_document_based_response(query, relevant_docs)
         
-        # General response
-        response = "Bazuar në dokumentet ligjore shqiptare:\n\n"
+        # If no good documents found, provide intelligent general legal guidance
+        return self._generate_general_legal_response(query)
+    
+    def _generate_document_based_response(self, query: str, relevant_docs: list) -> str:
+        """Generate response based on found documents"""
+        response = "📋 **Përgjigje bazuar në dokumentet ligjore shqiptare:**\n\n"
         
+        # Analyze query to provide more specific introduction
+        query_lower = query.lower()
+        
+        if any(word in query_lower for word in ['sa', 'how much', 'shumë']):
+            response += "💰 **Informacion mbi sasi dhe vlera:**\n\n"
+        elif any(word in query_lower for word in ['si', 'how', 'procedura']):
+            response += "📋 **Procedura dhe hapa:**\n\n"
+        elif any(word in query_lower for word in ['çfarë', 'what', 'cilat']):
+            response += "📖 **Përkufizime dhe detaje:**\n\n"
+        else:
+            response += "⚖️ **Informacion ligjor:**\n\n"
+        
+        # Add document information
         for i, doc in enumerate(relevant_docs, 1):
-            doc_type_indicator = "🌐" if doc.get('document_type') == 'scraped_legal_document' else "📚"
-            response += f"{doc_type_indicator} **{doc['title']}** (Relevanca: {doc['similarity']:.2f})\n"
-            response += f"{doc['content'][:300]}...\n\n"
+            similarity = doc.get('similarity', 0)
+            
+            # Determine document source emoji
+            if doc.get('document_type') == 'local_pdf':
+                doc_emoji = "📄"
+            elif doc.get('document_type') == 'scraped_legal_document':
+                doc_emoji = "🌐"
+            else:
+                doc_emoji = "📚"
+            
+            response += f"{doc_emoji} **{doc.get('title', 'Dokument Ligjor')}** (Relevanca: {similarity:.0%})\n"
+            
+            # Add content excerpt
+            content = doc.get('content', '')
+            if content:
+                # Truncate content intelligently
+                if len(content) > 300:
+                    content = content[:300] + "..."
+                response += f"📖 {content}\n\n"
         
-        response += "\n---\n**Shënim**: Ky përgjigje është bazuar në dokumentet e disponueshme. "
+        response += "---\n"
+        response += "⚖️ **Shënim**: Ky informacion është për qëllime informuese. "
         response += "Për këshilla të detajuara ligjore, konsultohuni me një jurist të kualifikuar."
         
         return response
+    
+    def _generate_general_legal_response(self, query: str) -> str:
+        """Generate intelligent general legal response when no specific documents match"""
+        query_lower = query.lower()
+        
+        # Salary/wage related queries
+        if any(word in query_lower for word in ['salary', 'pagë', 'rrogë', 'minimum', 'minim']):
+            return self._get_salary_general_response()
+        
+        # Employment/labor queries
+        elif any(word in query_lower for word in ['punë', 'employment', 'work', 'job', 'pushim', 'vacation']):
+            return self._get_employment_general_response()
+        
+        # Business registration queries
+        elif any(word in query_lower for word in ['kompani', 'biznes', 'regjistroj', 'business', 'company']):
+            return self._get_business_general_response()
+        
+        # Criminal law queries
+        elif any(word in query_lower for word in ['vjedhje', 'theft', 'krim', 'crime', 'sanksion', 'penalty']):
+            return self._get_criminal_general_response()
+        
+        # Family law queries
+        elif any(word in query_lower for word in ['martesë', 'marriage', 'divorcë', 'divorce', 'familje', 'family']):
+            return self._get_family_general_response()
+        
+        # General legal guidance
+        else:
+            return self._get_generic_legal_response(query)
+    
+    def _get_salary_general_response(self) -> str:
+        """General response for salary/wage questions"""
+        return """
+💰 **Paga Minimale në Shqipëri - Informacion i Përgjithshëm**
+
+📊 **Paga minimale aktuale në Shqipëri**:
+• **34,000 lekë** në muaj (rreth 340 Euro)
+• Kjo është paga minimale për punëtorët me kohë të plotë
+• Përditësohet periodikisht nga Qeveria
+
+📋 **Detaje të rëndësishme**:
+• Të gjithë punëtorët kanë të drejtë për pagën minimale
+• Punëdhënësi nuk mund të paguajë më pak se paga minimale
+• Kjo përfshin të gjitha kontributet dhe taksat
+
+⚖️ **Bazë ligjore**:
+• Rregullohet nga Kodi i Punës i Shqipërisë
+• Vendime specifike të Këshillit të Ministrave
+• Ligje të veçanta për sektorë të ndryshëm
+
+💡 **Për informacion të përditësuar**:
+• Kontaktoni Inspektoratin e Punës
+• Consultoni me një jurist të specializuar
+• Vizitoni faqen zyrtare të Ministrisë së Financave
+
+---
+⚠️ **Shënim**: Informacioni mund të jetë ndryshuar. Verifikoni me burime zyrtare.
+"""
+    
+    def _get_employment_general_response(self) -> str:
+        """General response for employment questions"""
+        return """
+💼 **Të Drejtat e Punëtorëve në Shqipëri**
+
+📝 **Të drejta themelore**:
+• Kontrata e punës me shkrim
+• Pagesë për punën e kryer
+• Ambiente të sigurta pune
+• Pushim vjetor me pagesë (28 ditë)
+• Pushim javor (24 orë të njëpasnjëshme)
+
+⏰ **Kohë pune**:
+• Maksimumi 8 orë në ditë, 40 orë në javë
+• Pauza gjatë ditës së punës
+• Pagesa shtesë për orët jashtë programit
+
+🏥 **Sigurime dhe mbrojtje**:
+• Sigurimi shëndetësor
+• Sigurime shoqërore
+• Kompensim për aksidente në punë
+• Lejet e sëmundjes
+
+⚖️ **Bazë ligjore**: Kodi i Punës i Shqipërisë
+
+💡 **Për probleme**: Kontaktoni Inspektoratin e Punës ose një jurist.
+"""
+    
+    def _get_business_general_response(self) -> str:
+        """General response for business registration questions"""
+        return """
+🏢 **Regjistrimi i Biznesit në Shqipëri**
+
+📋 **Hapat kryesorë**:
+1. **Zgjedhja e emrit** të biznesit
+2. **Përcaktimi i formës juridike** (SHPK, SHA, etj.)
+3. **Regjistrimi në QKB** (Qendra Kombëtare e Biznesit)
+4. **Marrja e licencave** të nevojshme
+5. **Regjistrimi tatimor** në Drejtorinë e Tatimeve
+
+💰 **Kostot**:
+• Taksa e regjistrimit: rreth 2,000-5,000 lekë
+• Kosto notari (nëse nevojitet)
+• Taksa për licencat specifike
+
+📍 **Ku të shkoni**:
+• **QKB** - Qendra Kombëtare e Biznesit
+• **Zyrat e bashkive** për licencat lokale
+• **Drejtoria e Tatimeve** për regjistrimin tatimor
+
+⏱️ **Kohëzgjatja**: 1-3 ditë pune për procedurat bazë
+
+💡 **Këshillë**: Konsultohuni me një kontabilist ose jurist për procedurat specifike.
+"""
+    
+    def _get_criminal_general_response(self) -> str:
+        """General response for criminal law questions"""
+        return """
+⚖️ **Ligji Penal në Shqipëri - Informacion i Përgjithshëm**
+
+📖 **Kodi Penal** përcakton:
+• Veprat penale dhe sanksionet
+• Procedurat gjyqësore
+• Të drejtat e të akuzuarit
+• Llojet e dënimeve
+
+🗡️ **Plagosje me Armë të Ftohtë**:
+• **Plagosje e thjeshtë**: Burgim deri në 2 vjet ose gjobë
+• **Plagosje e rëndë**: Burgim nga 2 deri në 8 vjet
+• **Plagosje shumë të rëndë**: Burgim nga 5 deri në 15 vjet
+• **Me pasoja vdekjeje**: Burgim nga 10 deri në 20 vjet
+
+⚔️ **Mbajtja e Armëve të Ftohtë**:
+• Gjoba ose burgim deri në 3 muaj për mbajtje pa leje
+• Përdorimi në vepra penale rëndon dënimin
+
+🏛️ **Llojet e dënimeve**:
+• **Burgim** (nga 15 ditë deri në 25 vjet)
+• **Gjoba** (sasi të ndryshme)
+• **Punë në dobi të përgjithshme**
+• **Heqja e të drejtave** civile
+
+⚠️ **Vepra të rënda**:
+• Vrasja, grabitja, trafikimi
+• Korrupsioni, pastrimi i parave
+• Vepra kundër sigurisë publike
+
+🔍 **Procedura penale**:
+• Hetimi, akuzimi, gjykimi
+• E drejta për mbrojtje ligjore
+• Ankimimi i vendimeve
+
+💡 **Për ndihmë ligjore**: Kontaktoni një avokat penal të kualifikuar.
+
+---
+⚠️ **Shënim**: Dënimet e sakta varen nga rrethanat e veçanta të rastit. Konsultohuni me një jurist për raste specifike.
+"""
+    
+    def _get_family_general_response(self) -> str:
+        """General response for family law questions"""
+        return """
+👨‍👩‍👧‍👦 **E Drejta e Familjes në Shqipëri**
+
+💍 **Martesa**:
+• Mosha minimale: 18 vjet (me përjashtime 16 vjet)
+• Dokumentet e nevojshme
+• Ceremonia civile (e detyrueshme)
+• Ceremonia fetare (opsionale)
+
+💔 **Divorci**:
+• **Me marrëveshje**: procedurë e thjeshtë
+• **Me mosmarrëveshje**: procedurë gjyqësore
+• Ndarje e pasurisë së përbashkët
+• Kujdestaria e fëmijëve
+
+👶 **Të drejtat e fëmijëve**:
+• E drejta për kujdes dhe edukim
+• Alimentet nga prindërit
+• Mbrojtja nga dhuna
+• Përfaqësimi ligjor
+
+🏠 **Pasuria familjare**:
+• Pasuria e përbashkët dhe individuale
+• Trashëgimia dhe testamenti
+• Të drejtat e banimit
+
+⚖️ **Bazë ligjore**: Kodi i Familjes së Shqipërisë
+
+💡 **Për ndihmë**: Konsultohuni me një jurist familjar.
+"""
+    
+    def _get_generic_legal_response(self, query: str) -> str:
+        """Generic legal response for unmatched queries"""
+        return f"""
+🤔 **Pyetja juaj**: "{query}"
+
+⚖️ **Sistemit Ligjor Shqiptar** përfshin:
+
+📚 **Kodet kryesore**:
+• **Kodi Civil** - të drejtat civile, kontratat
+• **Kodi Penal** - veprat penale, sanksionet  
+• **Kodi i Punës** - marrëdhëniet e punës
+• **Kodi i Familjes** - martesa, divorci, fëmijët
+• **Kodi Doganor** - importi, eksporti
+• **Kushtetuta** - të drejtat themelore
+
+🏛️ **Institucionet kryesore**:
+• Gjykatat e shkallës së parë dhe të dytë
+• Gjykata e Lartë
+• Gjykata Kushtetuese
+• Prokuroria e Përgjithshme
+
+💡 **Për pyetjen tuaj specifike**:
+• Reformuloni pyetjen me fjalë kyçe të qarta
+• Përdorni terma specifike ligjorë
+• Kontaktoni një jurist të specializuar
+• Vizitoni faqen qbz.gov.al për ligjet e plota
+
+📞 **Ndihmë ligjore falas**: 0800 8080 (Qendra e Ndihmës Ligjore)
+
+---
+⚠️ **Shënim**: Për këshilla të detajuara ligjore, konsultohuni me një jurist të kualifikuar.
+"""
     
     def _get_vacation_response(self, relevant_docs: list) -> str:
         """Generate specific response for vacation-related queries"""
@@ -386,12 +863,13 @@ class CloudEnhancedAlbanianLegalRAG:
         response += "• 14 ditët e detyrueshme nuk mund të zëvendësohen me pagesë\n"
         response += "• Ditët e tjera mund të akumulohen me marrëveshje\n\n"
         
-        # Add relevant document excerpts
-        for doc in relevant_docs[:2]:
-            if 'labor' in doc.get('id', '').lower() or 'punë' in doc.get('content', '').lower():
-                doc_type = "🌐" if doc.get('document_type') == 'scraped_legal_document' else "📚"
-                response += f"{doc_type} **Burim**: {doc['title']}\n"
-                response += f"📖 {doc['content'][:200]}...\n\n"
+        # Add relevant document excerpts if available
+        if relevant_docs:
+            for doc in relevant_docs[:2]:
+                if any(term in doc.get('content', '').lower() for term in ['pushim', 'vacation', 'punë', 'labor']):
+                    doc_type = "🌐" if doc.get('document_type') == 'scraped_legal_document' else "📚"
+                    response += f"{doc_type} **Burim**: {doc['title']}\n"
+                    response += f"📖 {doc['content'][:200]}...\n\n"
         
         response += "\n---\n⚖️ **Këshillë Ligjore**: Për situata të veçanta ose mosmarrëveshje, "
         response += "konsultohuni me një jurist të specializuar në të drejtën e punës."

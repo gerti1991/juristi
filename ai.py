@@ -1,6 +1,6 @@
 """
 Cloud LLM Integration for Albanian Legal RAG System
-Uses Groq API for advanced response generation with environment variables
+Support for Groq API, Google Gemini, and other providers
 """
 
 import os
@@ -9,23 +9,49 @@ import json
 from typing import List, Dict, Optional
 import time
 from dotenv import load_dotenv
+import google.generativeai as genai
 
 # Load environment variables from .env file
 load_dotenv()
 
 class CloudLLMClient:
-    """Client for cloud-based LLM services using environment variables"""
+    """Client for cloud-based LLM services supporting multiple providers"""
     
-    def __init__(self, provider="groq"):
+    def __init__(self, provider="gemini"):
         """Initialize cloud LLM client with environment variables"""
         self.provider = provider
         self.api_key = self._get_api_key()
         self.base_url = self._get_base_url()
         self.model = self._get_model()
         
+        # Initialize Gemini client if needed
+        if self.provider == "gemini" and self.api_key:
+            try:
+                genai.configure(api_key=self.api_key)
+                self.gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            except Exception as e:
+                print(f"Warning: Could not initialize Gemini: {e}")
+                self.gemini_model = None
+        else:
+            self.gemini_model = None
+        
     def _get_api_key(self) -> str:
         """Get API key from environment or config"""
-        if self.provider == "groq":
+        if self.provider == "gemini":
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                # Check config.py
+                try:
+                    import config
+                    api_key = getattr(config, 'GEMINI_API_KEY', None)
+                except ImportError:
+                    pass
+                
+                if not api_key:
+                    print("⚠️ GEMINI_API_KEY not found! Get your free API key from: https://aistudio.google.com/app/apikey")
+                    return ""
+            return api_key
+        elif self.provider == "groq":
             api_key = os.getenv("GROQ_API_KEY")
             if not api_key:
                 # Check config.py
@@ -45,7 +71,9 @@ class CloudLLMClient:
     
     def _get_base_url(self) -> str:
         """Get base URL for the provider"""
-        if self.provider == "groq":
+        if self.provider == "gemini":
+            return "https://generativelanguage.googleapis.com/v1beta/models"
+        elif self.provider == "groq":
             return "https://api.groq.com/openai/v1/chat/completions"
         elif self.provider == "huggingface":
             return "https://api-inference.huggingface.co/models/"
@@ -54,7 +82,9 @@ class CloudLLMClient:
     
     def _get_model(self) -> str:
         """Get model name for the provider"""
-        if self.provider == "groq":
+        if self.provider == "gemini":
+            return "gemini-2.0-flash-exp"  # Free and powerful model
+        elif self.provider == "groq":
             return "llama3-8b-8192"  # Fast and good for legal tasks
         elif self.provider == "huggingface":
             return "microsoft/DialoGPT-large"
@@ -77,7 +107,9 @@ class CloudLLMClient:
                 # Use documents + LLM knowledge
                 prompt = self._create_legal_prompt(query, relevant_docs, context)
             
-            if self.provider == "groq":
+            if self.provider == "gemini":
+                return self._gemini_request(prompt)
+            elif self.provider == "groq":
                 return self._groq_request(prompt)
             elif self.provider == "huggingface":
                 return self._huggingface_request(prompt)
@@ -172,6 +204,35 @@ PËRGJIGJJA:"""
             return data["choices"][0]["message"]["content"].strip()
         else:
             raise Exception(f"Groq API error: {response.status_code} - {response.text}")
+    
+    def _gemini_request(self, prompt: str) -> str:
+        """Make request to Google Gemini API"""
+        if not self.gemini_model:
+            raise Exception("Gemini model not initialized")
+        
+        try:
+            # Configure generation settings for legal content
+            generation_config = genai.types.GenerationConfig(
+                candidate_count=1,
+                max_output_tokens=2048,
+                temperature=0.3,
+                top_p=0.8,
+                top_k=40
+            )
+            
+            # Generate response using Gemini
+            response = self.gemini_model.generate_content(
+                prompt,
+                generation_config=generation_config
+            )
+            
+            if response.text:
+                return response.text.strip()
+            else:
+                raise Exception("Empty response from Gemini")
+                
+        except Exception as e:
+            raise Exception(f"Gemini API error: {str(e)}")
     
     def _huggingface_request(self, prompt: str) -> str:
         """Make request to Hugging Face API"""
