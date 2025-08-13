@@ -6,8 +6,8 @@ Now uses Groq API for advanced response generation with environment variables
 import os
 import streamlit as st
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
 import json
 from datetime import datetime
 from scraper import AlbanianLegalScraper
@@ -18,6 +18,9 @@ from typing import List, Dict, Optional
 
 # Load environment variables
 load_dotenv()
+
+# Detect headless mode (FastAPI)
+HEADLESS = os.getenv("RAG_HEADLESS", "0") == "1"
 
 # Set environment variables for PyTorch compatibility
 os.environ['TORCH_SHOW_CPP_STACKTRACES'] = '0'
@@ -31,35 +34,57 @@ class CloudEnhancedAlbanianLegalRAG:
         self.model_name = 'all-MiniLM-L6-v2'  # Fallback model
         self.model = None
         self.gemini_api_key = None
-        
+
         # Document storage
         self.legal_documents = []
         self.document_embeddings = None
+        # Super-chunking config (character-based)
+        self.superchunk_chars = int(os.getenv('RAG_SUPERCHUNK_CHARS', '4500'))
+        self.superchunk_overlap = int(os.getenv('RAG_SUPERCHUNK_OVERLAP', '500'))
+        # Sparse retrieval
+        self.tfidf_vectorizer = None
+        self.tfidf_matrix = None
         self.scraper = AlbanianLegalScraper(max_docs=10)
         self.cloud_llm = None
-        
+
         # Configuration from environment variables
         self.similarity_threshold = float(os.getenv('SIMILARITY_THRESHOLD', '0.15'))
-        self.max_context_length = int(os.getenv('MAX_CONTEXT_LENGTH', '4000'))
+        self.max_context_length = int(os.getenv('MAX_CONTEXT_LENGTH', '4000'))  # characters for packing
         self.max_chunks_to_return = int(os.getenv('MAX_CHUNKS_TO_RETURN', '5'))
-        
+        # Hybrid + reranking
+        self.hybrid_alpha = float(os.getenv('RAG_HYBRID_ALPHA', '0.5'))
+        self.mmr_lambda = float(os.getenv('RAG_MMR_LAMBDA', '0.5'))
+        self.neighbor_expansion = int(os.getenv('RAG_NEIGHBOR_EXPANSION', '1'))
+        # Conversation memory (in-process)
+        self.memory_store = {}
+        # Context packing (extractive) to reduce token usage
+        self.context_packing = os.getenv('RAG_CONTEXT_PACKING', '1') == '1'
+
         # Cache file for embeddings
         self.embeddings_cache_file = 'document_embeddings_cache_google.json'
-        
-        # Initialize Google API
+
+        # Initialize components
         self._setup_google_api()
-        
-        # Load fallback model if needed
         self._load_fallback_model()
-        
-        # Initialize cloud LLM
         self._load_cloud_llm()
-        
-        # Initialize document collection
         self._load_all_documents()
-        
-        # Generate embeddings
         self._generate_embeddings()
+
+    # -----------------------------
+    # Index building helpers
+    # -----------------------------
+    def _build_sparse_index(self, document_texts: List[str]):
+        """Build TF-IDF index for sparse retrieval."""
+        try:
+            self.tfidf_vectorizer = TfidfVectorizer(max_features=50000, ngram_range=(1, 2))
+            self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(document_texts)
+            if not HEADLESS:
+                st.success("✅ Built TF‑IDF index for hybrid retrieval")
+        except Exception as e:
+            if not HEADLESS:
+                st.warning(f"⚠️ Could not build TF‑IDF index: {e}")
+            self.tfidf_vectorizer = None
+            self.tfidf_matrix = None
     
     def _setup_google_api(self):
         """Setup Google API for embeddings"""
@@ -67,26 +92,35 @@ class CloudEnhancedAlbanianLegalRAG:
             self.gemini_api_key = os.getenv("GEMINI_API_KEY")
             if self.gemini_api_key:
                 genai.configure(api_key=self.gemini_api_key)
-                st.info("🔄 Google API configured for embeddings...")
+                if not HEADLESS:
+                    st.info("🔄 Google API configured for embeddings...")
                 self.use_google_embeddings = True
-                st.success("✅ Google embeddings enabled!")
+                if not HEADLESS:
+                    st.success("✅ Google embeddings enabled!")
             else:
-                st.warning("⚠️ GEMINI_API_KEY not found - using local embeddings")
+                if not HEADLESS:
+                    st.warning("⚠️ GEMINI_API_KEY not found - using local embeddings")
                 self.use_google_embeddings = False
         except Exception as e:
-            st.error(f"❌ Error setting up Google API: {e}")
+            if not HEADLESS:
+                st.error(f"❌ Error setting up Google API: {e}")
             self.use_google_embeddings = False
     
     def _load_fallback_model(self):
         """Load the local sentence transformer model as fallback"""
         if not self.use_google_embeddings:
             try:
-                st.info("🔄 Loading local AI model...")
+                # Lazy import to avoid torch dependency unless needed
+                from sentence_transformers import SentenceTransformer  # type: ignore
+                if not HEADLESS:
+                    st.info("🔄 Loading local AI model...")
                 self.model = SentenceTransformer(self.model_name)
-                st.success("✅ Local AI model loaded successfully!")
+                if not HEADLESS:
+                    st.success("✅ Local AI model loaded successfully!")
             except Exception as e:
-                st.error(f"❌ Error loading local model: {e}")
-                st.info("Please ensure sentence-transformers is installed: pip install sentence-transformers")
+                if not HEADLESS:
+                    st.error(f"❌ Error loading local model: {e}")
+                    st.info("Local embeddings disabled. Using Google embeddings only.")
                 self.model = None
 
     def _get_google_embeddings(self, texts: List[str]) -> Optional[np.ndarray]:
@@ -95,34 +129,25 @@ class CloudEnhancedAlbanianLegalRAG:
             return None
             
         try:
-            # Use Google's text-embedding-004 model (latest and best)
-            embeddings = []
-            batch_size = 100  # Process in batches to avoid rate limits
-            
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                
-                # Get embeddings for this batch
-                result = genai.embed_content(
+            # Use Google's text-embedding-004 model (latest) — call per text
+            embeddings: List[List[float]] = []
+            for text in texts:
+                res = genai.embed_content(
                     model="models/text-embedding-004",
-                    content=batch,
-                    task_type="retrieval_document"  # Optimized for document retrieval
+                    content=text,
+                    task_type="retrieval_document"
                 )
-                
-                # Extract embeddings from result
-                if hasattr(result, 'embedding'):
-                    # Single text
-                    embeddings.append(result['embedding'])
-                else:
-                    # Multiple texts
-                    for embedding in result['embedding']:
-                        embeddings.append(embedding)
-            
-            return np.array(embeddings)
+                vec = res.get('embedding') if isinstance(res, dict) else getattr(res, 'embedding', None)
+                if not vec:
+                    raise ValueError("Empty embedding from Google API")
+                embeddings.append(vec)
+
+            return np.array(embeddings, dtype=float)
             
         except Exception as e:
-            st.error(f"❌ Google embeddings error: {e}")
-            st.info("Falling back to local embeddings...")
+            if not HEADLESS:
+                st.error(f"❌ Google embeddings error: {e}")
+                st.info("Falling back to local embeddings...")
             self.use_google_embeddings = False
             return None
 
@@ -138,26 +163,34 @@ class CloudEnhancedAlbanianLegalRAG:
                 task_type="retrieval_query"  # Optimized for query embedding
             )
             
-            return np.array([result['embedding']])
+            vec = result.get('embedding') if isinstance(result, dict) else getattr(result, 'embedding', None)
+            if not vec:
+                return None
+            return np.array([vec], dtype=float)
             
         except Exception as e:
-            st.error(f"❌ Google query embedding error: {e}")
+            if not HEADLESS:
+                st.error(f"❌ Google query embedding error: {e}")
             return None
     
     def _load_cloud_llm(self):
         """Initialize cloud LLM client"""
         try:
-            st.info("🌐 Connecting to cloud LLM...")
+            if not HEADLESS:
+                st.info("🌐 Connecting to cloud LLM...")
             self.cloud_llm = CloudLLMClient("gemini")  # Changed to Gemini as default
             
             if self.cloud_llm.api_key:
-                st.success("✅ Cloud LLM connected successfully!")
-                st.info(f"🤖 Using model: {self.cloud_llm.model}")
+                if not HEADLESS:
+                    st.success("✅ Cloud LLM connected successfully!")
+                    st.info(f"🤖 Using model: {self.cloud_llm.model}")
             else:
-                st.warning("⚠️ Cloud LLM API key not found - using fallback responses")
+                if not HEADLESS:
+                    st.warning("⚠️ Cloud LLM API key not found - using fallback responses")
         except Exception as e:
-            st.error(f"❌ Cloud LLM connection error: {e}")
-            st.info("Will use template-based responses as fallback")
+            if not HEADLESS:
+                st.error(f"❌ Cloud LLM connection error: {e}")
+                st.info("Will use template-based responses as fallback")
             self.cloud_llm = None
     
     def _load_hardcoded_documents(self):
@@ -235,10 +268,16 @@ class CloudEnhancedAlbanianLegalRAG:
         """Load documents scraped from qbz.gov.al"""
         try:
             scraped_docs = self.scraper.get_processed_documents_for_rag()
-            st.info(f"📄 Loaded {len(scraped_docs)} scraped document chunks")
-            return scraped_docs
+            if not HEADLESS:
+                st.info(f"📄 Loaded {len(scraped_docs)} scraped document chunks")
+            # Merge to super-chunks for speed and better cross-paragraph combinations
+            merged = self._to_superchunks(scraped_docs, self.superchunk_chars, self.superchunk_overlap)
+            if not HEADLESS:
+                st.info(f"🧩 Built {len(merged)} super-chunks for scraped docs (≈{self.superchunk_chars} chars each)")
+            return merged
         except Exception as e:
-            st.warning(f"⚠️ Could not load scraped documents: {e}")
+            if not HEADLESS:
+                st.warning(f"⚠️ Could not load scraped documents: {e}")
             return []
     
     def _load_pdf_documents(self):
@@ -261,10 +300,16 @@ class CloudEnhancedAlbanianLegalRAG:
                     }
                     normalized_docs.append(normalized_doc)
                 
-                st.info(f"📄 Loaded {len(normalized_docs)} PDF document chunks")
-                return normalized_docs
+                if not HEADLESS:
+                    st.info(f"📄 Loaded {len(normalized_docs)} PDF document chunks")
+                # Merge into super-chunks for better semantic coverage
+                merged = self._to_superchunks(normalized_docs, self.superchunk_chars, self.superchunk_overlap)
+                if not HEADLESS:
+                    st.info(f"🧩 Built {len(merged)} super-chunks for PDF docs (≈{self.superchunk_chars} chars each)")
+                return merged
             else:
-                st.warning("⚠️ No processed PDF documents found")
+                if not HEADLESS:
+                    st.warning("⚠️ No processed PDF documents found")
                 return []
         except Exception as e:
             st.warning(f"⚠️ Could not load PDF documents: {e}")
@@ -283,9 +328,17 @@ class CloudEnhancedAlbanianLegalRAG:
         
         # Combine all documents
         self.legal_documents = hardcoded + scraped + pdf_docs
+        # Ensure IDs exist for neighbor expansion and caching determinism
+        for i, d in enumerate(self.legal_documents):
+            if 'id' not in d or not d.get('id'):
+                prefix = (d.get('source') or d.get('url') or d.get('title') or 'doc').replace(' ', '_')
+                d['id'] = f"{prefix}_chunk_{i}"
         
-        st.info(f"📚 Total documents loaded: {len(self.legal_documents)} "
-                f"({len(hardcoded)} hardcoded + {len(scraped)} scraped + {len(pdf_docs)} PDF)")
+        if not HEADLESS:
+            st.info(
+                f"📚 Total documents loaded: {len(self.legal_documents)} "
+                f"({len(hardcoded)} hardcoded + {len(scraped)} scraped + {len(pdf_docs)} PDF)"
+            )
     
     def _load_embeddings_cache(self):
         """Load cached embeddings if available"""
@@ -298,12 +351,18 @@ class CloudEnhancedAlbanianLegalRAG:
                 
                 # Check if cache is still valid
                 if (cache.get('document_count') == len(self.legal_documents) and 
-                    cache.get('embedding_type') == ('google' if self.use_google_embeddings else 'local')):
+                    cache.get('embedding_type') == ('google' if self.use_google_embeddings else 'local') and
+                    cache.get('chunking', {}) == {
+                        'superchunk_chars': self.superchunk_chars,
+                        'superchunk_overlap': self.superchunk_overlap
+                    }):
                     self.document_embeddings = np.array(cache['embeddings'])
-                    st.success(f"✅ Loaded cached {'Google' if self.use_google_embeddings else 'local'} embeddings")
+                    if not HEADLESS:
+                        st.success(f"✅ Loaded cached {'Google' if self.use_google_embeddings else 'local'} embeddings")
                     return True
             except Exception as e:
-                st.warning(f"⚠️ Could not load embedding cache: {e}")
+                if not HEADLESS:
+                    st.warning(f"⚠️ Could not load embedding cache: {e}")
         
         return False
     
@@ -316,24 +375,32 @@ class CloudEnhancedAlbanianLegalRAG:
                 'embeddings': self.document_embeddings.tolist(),
                 'document_count': len(self.legal_documents),
                 'embedding_type': 'google' if self.use_google_embeddings else 'local',
-                'created_at': datetime.now().isoformat()
+                'created_at': datetime.now().isoformat(),
+                'chunking': {
+                    'superchunk_chars': self.superchunk_chars,
+                    'superchunk_overlap': self.superchunk_overlap
+                }
             }
             
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cache, f)
                 
-            st.success(f"✅ {'Google' if self.use_google_embeddings else 'Local'} embeddings cached for faster loading")
+            if not HEADLESS:
+                st.success(f"✅ {'Google' if self.use_google_embeddings else 'Local'} embeddings cached for faster loading")
         except Exception as e:
-            st.warning(f"⚠️ Could not save embedding cache: {e}")
+            if not HEADLESS:
+                st.warning(f"⚠️ Could not save embedding cache: {e}")
     
     def _generate_embeddings(self):
         """Generate embeddings for all documents using Google or local model"""
         if not self.use_google_embeddings and not self.model:
-            st.error("❌ No embedding model available - cannot generate embeddings")
+            if not HEADLESS:
+                st.error("❌ No embedding model available - cannot generate embeddings")
             return
         
         if not self.legal_documents:
-            st.error("❌ No documents loaded - cannot generate embeddings")
+            if not HEADLESS:
+                st.error("❌ No documents loaded - cannot generate embeddings")
             return
         
         # Try to load from cache first
@@ -342,7 +409,8 @@ class CloudEnhancedAlbanianLegalRAG:
         
         try:
             if self.use_google_embeddings:
-                st.info("🔄 Generating Google embeddings for better Albanian legal search...")
+                if not HEADLESS:
+                    st.info("🔄 Generating Google embeddings for better Albanian legal search...")
                 
                 # Prepare document texts with enhanced content
                 document_texts = []
@@ -358,13 +426,15 @@ class CloudEnhancedAlbanianLegalRAG:
                 
                 if self.document_embeddings is not None:
                     self._save_embeddings_cache()
-                    st.success(f"✅ Generated Google embeddings for {len(self.legal_documents)} documents")
+                    if not HEADLESS:
+                        st.success(f"✅ Generated Google embeddings for {len(self.legal_documents)} documents")
                 else:
                     raise Exception("Failed to generate Google embeddings")
                     
             else:
                 # Fallback to local embeddings
-                st.info("🔄 Generating local embeddings...")
+                if not HEADLESS:
+                    st.info("🔄 Generating local embeddings...")
                 
                 document_texts = []
                 for doc in self.legal_documents:
@@ -373,29 +443,58 @@ class CloudEnhancedAlbanianLegalRAG:
                 
                 self.document_embeddings = self.model.encode(document_texts)
                 self._save_embeddings_cache()
-                st.success(f"✅ Generated local embeddings for {len(self.legal_documents)} documents")
+                if not HEADLESS:
+                    st.success(f"✅ Generated local embeddings for {len(self.legal_documents)} documents")
+
+            # Build sparse index for hybrid retrieval using the same document_texts prepared above
+            try:
+                if 'document_texts' not in locals():
+                    # Re-create document_texts if not present
+                    document_texts = []
+                    for doc in self.legal_documents:
+                        enhanced_text = f"{doc['title']} — {doc['content']} {doc.get('content_en', '')}"
+                        document_texts.append(enhanced_text)
+                self._build_sparse_index(document_texts)
+            except Exception:
+                pass
             
         except Exception as e:
-            st.error(f"❌ Error generating embeddings: {e}")
+            if not HEADLESS:
+                st.error(f"❌ Error generating embeddings: {e}")
             
             # Try fallback to local model if Google fails
             if self.use_google_embeddings and self.model:
-                st.info("🔄 Trying local embeddings as fallback...")
+                if not HEADLESS:
+                    st.info("🔄 Trying local embeddings as fallback...")
                 try:
                     self.use_google_embeddings = False
                     self._generate_embeddings()
                 except Exception as fallback_error:
-                    st.error(f"❌ Fallback also failed: {fallback_error}")
+                    if not HEADLESS:
+                        st.error(f"❌ Fallback also failed: {fallback_error}")
                     self.document_embeddings = None
     
-    def search_documents(self, query: str, top_k: int = 3):
-        """Search for relevant documents using semantic similarity with Google or local embeddings"""
+    def search_documents(self, query: str, top_k: int = 3, mode: str = 'hybrid', session_id: Optional[str] = None, multi_query: bool = True):
+        """Search for relevant documents using hybrid retrieval and MMR diversification.
+
+        Args:
+            query: user query
+            top_k: number of chunks to return
+            mode: 'hybrid' | 'embedding' | 'sparse'
+            session_id: optional conversation id for context-aware expansion
+            multi_query: expand query into variants and aggregate
+        """
         if self.document_embeddings is None:
             return []
         
         try:
             # Enhance Albanian queries for better semantic search
             enhanced_query = self._enhance_albanian_query(query)
+
+            # Include brief memory to disambiguate retrieval (last 2 user turns)
+            memory_context = self.get_memory_context(session_id) if session_id else ""
+            if memory_context:
+                enhanced_query = f"{enhanced_query} \nKontekst bisede: {memory_context}"
             
             # Generate query embedding using appropriate method
             if self.use_google_embeddings:
@@ -405,26 +504,79 @@ class CloudEnhancedAlbanianLegalRAG:
                     if self.model:
                         query_embedding = self.model.encode([enhanced_query])
                     else:
-                        st.error("❌ No embedding method available for query")
+                        if not HEADLESS:
+                            st.error("❌ No embedding method available for query")
                         return []
             else:
                 if not self.model:
-                    st.error("❌ Local model not loaded")
+                    if not HEADLESS:
+                        st.error("❌ Local model not loaded")
                     return []
                 query_embedding = self.model.encode([enhanced_query])
             
-            # Calculate similarities
-            similarities = cosine_similarity(query_embedding, self.document_embeddings)[0]
+            # Calculate dense similarities
+            dense_sim = cosine_similarity(query_embedding, self.document_embeddings)[0]
+
+            # Calculate sparse similarities if enabled
+            sparse_sim = None
+            if self.tfidf_vectorizer is not None and self.tfidf_matrix is not None and mode in ('hybrid', 'sparse'):
+                try:
+                    q_vec = self.tfidf_vectorizer.transform([enhanced_query])
+                    # cosine similarity for sparse vectors
+                    # sklearn doesn't provide direct; use dot product as TF-IDF is L2-normalized by default
+                    sparse_sim = (q_vec @ self.tfidf_matrix.T).toarray()[0]
+                except Exception:
+                    sparse_sim = None
+
+            # Combine
+            if mode == 'embedding' or sparse_sim is None:
+                combined_sim = dense_sim
+            elif mode == 'sparse':
+                combined_sim = sparse_sim
+            else:
+                alpha = self.hybrid_alpha
+                combined_sim = alpha * dense_sim + (1 - alpha) * sparse_sim
             
-            # Get top matches
-            top_indices = np.argsort(similarities)[::-1][:top_k]
+            # Multi-query expansion (lightweight): include original + 1-2 heuristic rewrites
+            if multi_query:
+                rewrites = self._expand_queries(enhanced_query)
+                for rw in rewrites:
+                    if rw.strip() == enhanced_query.strip():
+                        continue
+                    # Dense
+                    if self.use_google_embeddings:
+                        rw_emb = self._get_google_query_embedding(rw)
+                        if rw_emb is None and self.model:
+                            rw_emb = self.model.encode([rw])
+                    else:
+                        rw_emb = self.model.encode([rw]) if self.model else None
+                    if rw_emb is not None:
+                        rw_dense = cosine_similarity(rw_emb, self.document_embeddings)[0]
+                        if mode == 'embedding' or (self.tfidf_vectorizer is None or self.tfidf_matrix is None):
+                            combined_sim = np.maximum(combined_sim, rw_dense)
+                        else:
+                            # Sparse for rewrite
+                            try:
+                                qv = self.tfidf_vectorizer.transform([rw])
+                                rw_sparse = (qv @ self.tfidf_matrix.T).toarray()[0]
+                                alpha = self.hybrid_alpha if mode == 'hybrid' else 0.0
+                                rw_comb = alpha * rw_dense + (1 - alpha) * rw_sparse
+                                combined_sim = np.maximum(combined_sim, rw_comb)
+                            except Exception:
+                                combined_sim = np.maximum(combined_sim, rw_dense)
+
+            # MMR selection to diversify
+            selected_indices = self._mmr_select(query_embedding[0], self.document_embeddings, combined_sim, k=top_k, lambda_param=self.mmr_lambda)
+
+            # Optionally expand with neighbors from same document (by chunk id suffix)
+            expanded_indices = self._expand_neighbors(selected_indices, self.neighbor_expansion)
             
             results = []
             max_similarity = 0
             
             # Find the maximum similarity to make adaptive threshold decisions
-            for idx in top_indices:
-                similarity = float(similarities[idx])
+            for idx in expanded_indices:
+                similarity = float(combined_sim[idx])
                 if similarity > max_similarity:
                     max_similarity = similarity
                 
@@ -436,7 +588,7 @@ class CloudEnhancedAlbanianLegalRAG:
                 
                 adaptive_threshold = max(base_threshold, max_similarity * 0.7) if max_similarity > 0.2 else base_threshold
                 
-                if similarity > adaptive_threshold or (len(results) == 0 and idx == top_indices[0] and similarity > 0.1):
+                if similarity > adaptive_threshold or (len(results) == 0 and idx == expanded_indices[0] and similarity > 0.1):
                     doc = self.legal_documents[idx].copy()
                     doc['similarity'] = similarity
                     results.append(doc)
@@ -447,8 +599,93 @@ class CloudEnhancedAlbanianLegalRAG:
             return results
             
         except Exception as e:
-            st.error(f"❌ Search error: {e}")
+            if not HEADLESS:
+                st.error(f"❌ Search error: {e}")
             return []
+
+    def _expand_neighbors(self, indices: List[int], window: int) -> List[int]:
+        """Expand selected indices by including +/- window neighbors within same document chunks when ids suggest ordering."""
+        if window <= 0:
+            return indices
+        expanded: set[int] = set(indices)
+        for idx in indices:
+            base_id = self.legal_documents[idx].get('id', '')
+            # Extract numeric chunk suffix if present
+            chunk_num = None
+            prefix = None
+            if '_chunk_' in base_id:
+                try:
+                    chunk_num = int(base_id.split('_chunk_')[-1])
+                    prefix = base_id.rsplit('_chunk_', 1)[0]
+                except Exception:
+                    chunk_num = None
+            if chunk_num is not None and prefix is not None:
+                # search neighbors in list for same prefix and num +/- window
+                for j, d in enumerate(self.legal_documents):
+                    did = d.get('id', '')
+                    if did.startswith(prefix + '_chunk_'):
+                        try:
+                            n = int(did.split('_chunk_')[-1])
+                            if abs(n - chunk_num) <= window:
+                                expanded.add(j)
+                        except Exception:
+                            continue
+        return list(expanded)
+
+    def _mmr_select(self, query_vec: np.ndarray, doc_embs: np.ndarray, sim_scores: np.ndarray, k: int, lambda_param: float = 0.5) -> List[int]:
+        """Maximal Marginal Relevance selection to diversify top-k results."""
+        if k <= 0:
+            return []
+        selected: List[int] = []
+        candidates = set(range(len(sim_scores)))
+        # Precompute doc-doc similarities lazily when needed
+        doc_norms = np.linalg.norm(doc_embs, axis=1) + 1e-10
+        while len(selected) < k and candidates:
+            if not selected:
+                # pick max sim
+                idx = int(np.argmax(sim_scores))
+                selected.append(idx)
+                candidates.discard(idx)
+                continue
+            best_idx: Optional[int] = None
+            best_score = -1e9
+            for i in list(candidates):
+                # relevance
+                rel = sim_scores[i]
+                # redundancy: max similarity to already selected
+                red = 0.0
+                for s in selected:
+                    # cosine between doc i and doc s using precomputed embs
+                    dot = float(np.dot(doc_embs[i], doc_embs[s]))
+                    sim = dot / (doc_norms[i] * doc_norms[s])
+                    if sim > red:
+                        red = sim
+                mmr_score = lambda_param * rel - (1 - lambda_param) * red
+                if mmr_score > best_score:
+                    best_score = mmr_score
+                    best_idx = i
+            if best_idx is None:
+                break
+            selected.append(best_idx)
+            candidates.discard(best_idx)
+        return selected
+
+    def _expand_queries(self, enhanced_query: str) -> List[str]:
+        """Heuristic multi-query rewrites to improve recall without extra LLM calls."""
+        q = enhanced_query
+        rewrites = []
+        # Swap some common Albanian synonyms order
+        rewrites.append(q.replace('procedurë', 'hapa'))
+        rewrites.append(q.replace('dënim', 'sanksion'))
+        rewrites.append(q.replace('pagë', 'rrogë'))
+        # English hint variant
+        rewrites.append(q + " in English: law code article section penalty definition procedure")
+        # Deduplicate and limit
+        uniq: List[str] = []
+        for r in rewrites:
+            if r not in uniq:
+                uniq.append(r)
+        return uniq[:3]
     
     def _enhance_albanian_query(self, query: str) -> str:
         """Enhance Albanian queries with comprehensive legal synonyms and context"""
@@ -537,19 +774,28 @@ class CloudEnhancedAlbanianLegalRAG:
         
         return enhanced_query
     
-    def search_legal_documents(self, query: str) -> str:
+    def search_legal_documents(self, query: str, session_id: Optional[str] = None) -> str:
         """Main interface method for searching and responding to legal queries"""
         try:
             # Search for relevant documents
-            relevant_docs = self.search_documents(query, top_k=self.max_chunks_to_return)
+            relevant_docs = self.search_documents(query, top_k=self.max_chunks_to_return, mode='hybrid', session_id=session_id)
+            
+            # Compact context to fit budget and accelerate LLM
+            docs_for_llm = self._compact_docs(relevant_docs, query, self.max_context_length) if self.context_packing else relevant_docs
             
             # Generate comprehensive response
-            response = self.generate_response(query, relevant_docs)
+            response = self.generate_response(query, docs_for_llm, session_id=session_id)
+
+            # Persist in-memory conversation if session provided
+            if session_id:
+                self.add_to_memory(session_id, role='user', content=query)
+                self.add_to_memory(session_id, role='assistant', content=response)
             
             return response
             
         except Exception as e:
-            st.error(f"❌ Search error: {e}")
+            if not HEADLESS:
+                st.error(f"❌ Search error: {e}")
             return f"❌ **Gabim në kërkim**: {e}\n\n⚖️ Ju lutem provoni përsëri ose kontaktoni një jurist."
     
     def _find_similar_documents(self, query: str, top_k: int = 5):
@@ -559,18 +805,153 @@ class CloudEnhancedAlbanianLegalRAG:
         # Return in the format expected by test files: (doc, similarity) tuples
         return [(doc, doc.get('similarity', 0.0)) for doc in docs]
     
-    def generate_response(self, query: str, relevant_docs: list) -> str:
+    def generate_response(self, query: str, relevant_docs: list, session_id: Optional[str] = None) -> str:
         """Generate a comprehensive response using cloud LLM or fallback"""
+        # Build memory context for LLM
+        memory_context = self.get_memory_context(session_id) if session_id else ""
+        # Trim memory context to keep prompts small
+        if len(memory_context) > 1000:
+            memory_context = memory_context[-1000:]
         if self.cloud_llm and self.cloud_llm.api_key:
             try:
                 # Use cloud LLM for advanced response generation
-                return self.cloud_llm.generate_response(query, relevant_docs)
+                return self.cloud_llm.generate_response(query, relevant_docs, context=memory_context)
             except Exception as e:
-                st.warning(f"⚠️ Cloud LLM error, using fallback: {e}")
+                if not HEADLESS:
+                    st.warning(f"⚠️ Cloud LLM error, using fallback: {e}")
                 return self._fallback_response(query, relevant_docs)
         else:
             # Use fallback response
             return self._fallback_response(query, relevant_docs)
+
+    # -----------------------------
+    # Super-chunking and context packing helpers
+    # -----------------------------
+    def _to_superchunks(self, docs: List[Dict], chunk_chars: int, overlap_chars: int) -> List[Dict]:
+        """Merge chunks into larger super-chunks, grouped per source/filename for coherence."""
+        if chunk_chars <= 0 or not docs:
+            return docs
+        # Group docs by a stable key (source or title)
+        groups: Dict[str, List[Dict]] = {}
+        for d in docs:
+            key = (d.get('source') or d.get('url') or d.get('title') or 'doc').strip()
+            groups.setdefault(key, []).append(d)
+        merged: List[Dict] = []
+        for key, items in groups.items():
+            # keep order
+            buffer = ""
+            meta = items[0]
+            part = 0
+            def flush(buf: str, m: Dict, p: int):
+                if not m or not buf:
+                    return
+                item = {
+                    'title': m.get('title', 'Document'),
+                    'content': buf,
+                    'source': m.get('source', key),
+                    'url': m.get('url', ''),
+                    'document_type': m.get('document_type', 'local_pdf'),
+                    'id': f"{(key or 'doc').replace(' ', '_')}_chunk_{p}"
+                }
+                merged.append(item)
+            for d in items:
+                text = d.get('content', '')
+                if not buffer:
+                    buffer = text
+                else:
+                    buffer += "\n\n" + text
+                while len(buffer) > chunk_chars:
+                    to_take = buffer[:chunk_chars]
+                    flush(to_take.strip(), meta, part)
+                    part += 1
+                    start = max(0, len(to_take) - overlap_chars)
+                    buffer = buffer[start:]
+            flush(buffer.strip(), meta, part)
+        return merged
+
+    def _compact_docs(self, docs: List[Dict], query: str, budget_chars: int) -> List[Dict]:
+        """Extractive packing: select top sentences from each doc to fit within a character budget.
+
+        Keeps document metadata; reduces content length to accelerate LLM and reduce tokens.
+        """
+        if budget_chars <= 0 or not docs:
+            return docs
+        # Split into sentences (simple heuristic)
+        packed: List[Dict] = []
+        remaining = max(500, budget_chars)  # ensure some reasonable space
+        # Distribute budget roughly evenly across docs
+        per_doc = max(250, remaining // max(1, len(docs)))
+        for d in docs:
+            content = d.get('content', '')
+            excerpt = self._select_top_sentences(content, query, max_chars=per_doc)
+            new_d = d.copy()
+            if excerpt:
+                new_d['content'] = excerpt
+            packed.append(new_d)
+        return packed
+
+    def _select_top_sentences(self, text: str, query: str, max_chars: int = 600) -> str:
+        """Score sentences by TF-IDF against the query and return the best within max_chars."""
+        if not text:
+            return text
+        # Naive sentence split
+        sentences = [s.strip() for s in text.replace('\n', ' ').split('.') if s.strip()]
+        if not sentences:
+            return text[:max_chars]
+        # Build corpus of sentences + query
+        corpus = sentences + [query]
+        try:
+            vec = TfidfVectorizer(max_features=5000, ngram_range=(1, 2)).fit_transform(corpus)
+            q_vec = vec[-1]
+            s_mat = vec[:-1]
+            scores = (s_mat @ q_vec.T).toarray().ravel()
+        except Exception:
+            # Fallback: length-based
+            scores = np.array([len(s) for s in sentences], dtype=float)
+        order = np.argsort(-scores)
+        picked: List[str] = []
+        total = 0
+        for idx in order:
+            s = sentences[idx]
+            if s.endswith('.'):
+                sent = s
+            else:
+                sent = s + '.'
+            if total + len(sent) > max_chars:
+                if total < max_chars * 0.6:  # allow one longer sentence to avoid empty
+                    picked.append(sent[: max(0, max_chars - total)])
+                break
+            picked.append(sent)
+            total += len(sent)
+            if total >= max_chars:
+                break
+        return ' '.join(picked) if picked else text[:max_chars]
+
+    # -----------------------------
+    # Conversation memory
+    # -----------------------------
+    def add_to_memory(self, session_id: str, role: str, content: str, max_turns: int = 10):
+        if not session_id:
+            return
+        hist = self.memory_store.setdefault(session_id, [])
+        hist.append({"role": role, "content": content})
+        # cap memory
+        if len(hist) > 2 * max_turns:
+            self.memory_store[session_id] = hist[-2 * max_turns :]
+
+    def get_memory_context(self, session_id: Optional[str], last_n: int = 4) -> str:
+        if not session_id:
+            return ""
+        hist = self.memory_store.get(session_id, [])
+        if not hist:
+            return ""
+        # Take last_n turns
+        snippet = hist[-last_n:]
+        formatted = []
+        for h in snippet:
+            role = 'Përdoruesi' if h['role'] == 'user' else 'Asistenti'
+            formatted.append(f"{role}: {h['content']}")
+        return "\n".join(formatted)
     
     def _fallback_response(self, query: str, relevant_docs: list) -> str:
         """Enhanced fallback response with intelligent general legal knowledge"""
