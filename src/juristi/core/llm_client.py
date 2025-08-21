@@ -20,6 +20,7 @@ class CloudLLMClient:
     def __init__(self, provider="gemini"):
         """Initialize cloud LLM client with environment variables"""
         self.provider = provider
+        self.current_provider = provider  # Add missing attribute
         self.api_key = self._get_api_key()
         self.base_url = self._get_base_url()
         self.model = self._get_model()
@@ -141,31 +142,82 @@ PËRGJIGJJA:
         return prompt
     
     def _create_legal_prompt(self, query: str, relevant_docs: List[Dict], context: str = "") -> str:
-        """Create a specialized prompt for Albanian legal queries"""
+        """Create a comprehensive legal analysis prompt that synthesizes multiple documents"""
         
-        # Build context from relevant documents
-        doc_context = ""
-        for i, doc in enumerate(relevant_docs[:3], 1):
-            doc_type = "🌐 Dokument i shkarkuar" if doc.get('document_type') == 'scraped_legal_document' else "📚 Dokument bazë"
-            doc_context += f"\n{i}. {doc_type}: {doc['title']}\n"
-            doc_context += f"Përmbajtja: {doc['content'][:400]}...\n"
+        # Extract key information from documents
+        legal_sources = []
+        all_articles = []
         
-        prompt = f"""Ti je një ekspert i ligjit shqiptar. Përgjigju në pyetjen e dhënë bazuar në dokumentet ligjore të ofruara.
+        for doc in relevant_docs[:5]:  # Use top 5 most relevant documents
+            title = doc.get('title', 'Dokument pa titull')
+            content = doc.get('content', '')
+            source = doc.get('source', 'Pa burim')
+            
+            # Extract law codes and articles
+            import re
+            articles = re.findall(r'[Nn]eni\s*\d+[a-z]*', content)
+            all_articles.extend(articles)
+            
+            legal_sources.append({
+                'title': title,
+                'source': source,
+                'content': content[:800],  # Limit content length but keep substantial info
+                'articles': articles[:3] if articles else []
+            })
+        
+        # Build comprehensive synthesis prompt
+        sources_text = ""
+        for i, source in enumerate(legal_sources, 1):
+            sources_text += f"""
+DOKUMENTI {i}: {source['title']}
+Burimi: {source['source']}
+Nenet e përfshira: {', '.join(source['articles']) if source['articles'] else 'Të ndryshme'}
 
-PYETJA: {query}
+Përmbajtja:
+{source['content']}
 
-DOKUMENTET LIGJORE:
-{doc_context}
+---"""
+        
+        prompt = f"""Ti je një ekspert i lartë i së drejtës shqiptare me dekada përvojë në interpretimin e legjislacionit shqiptar. Të jepet një pyetje ligjore dhe disa dokumente relevante.
 
-UDHËZIME:
-- Përgjigju në gjuhën shqipe
-- Jep informacion të saktë dhe të bazuar në dokumentet e dhëna
-- Përdor një ton profesional dhe të qartë
-- Nëse informacioni nuk është i mjaftueshëm, thuaj se duhen këshilla të mëtejshme nga një jurist
-- Mos shpik informacion që nuk gjendet në dokumentet e dhëna
+PYETJA E KLIENTIT: {query}
 
-PËRGJIGJJA:"""
+DOKUMENTET LIGJORE PËR ANALIZË:
+{sources_text}
 
+DETYRA JOTE:
+Krijo një analizë të plotë juridike që SINTETIZON të gjitha dokumentet e mësipërme për të dhënë një përgjigje të vetme, koherente dhe autoritare. 
+
+STRUKTURA E PËRGJIGJES:
+
+🎯 **PËRGJIGJJA E DREJTPËRDREJTË**
+Jep një përgjigje të qartë dhe konkrete për pyetjen e bërë.
+
+⚖️ **BAZAT LIGJORE**
+Lista të gjitha nenet, kodet dhe ligjet relevante nga dokumentet e analizuara.
+
+📖 **ANALIZA JURIDIKE** 
+Shpjego logjikën ligjore duke kombinuar informacionin nga të gjitha dokumentet. Trego se si ligjet e ndryshme lidhen dhe ndikojnë tek njëra-tjetra.
+
+⚠️ **RASTE TË VEÇANTA & PËRJASHTIME**
+Nëse ka përjashtime, kushte të veçanta ose nuanca të rëndësishme.
+
+🏛️ **KËSHILLA PRAKTIKE**
+Sugjerime konkrete për personin që pyet.
+
+📋 **HAPA TË MËTEJSHËM**
+Çfarë duhet të bëjë personi në vazhdim.
+
+RREGULLA TË RËNDËSISHME:
+- Përdor VETËM informacionin nga dokumentet e dhëna
+- SINTETIZO dokumentet për të krijuar një përgjigje të vetme koherente
+- MOS listosh dokumente individualisht - kombinoji ato
+- Përdor gjuhën shqipe profesionale dhe të qartë
+- Jep një përgjigje autoritare dhe të sigurt
+- Nëse ka informacion kontraditor, shpjegoje qartë
+
+FORMATI: Përdor emoji dhe formatim të qartë si në strukturën e mësipërme."""
+        
         return prompt
     
     def _groq_request(self, prompt: str) -> str:
@@ -200,39 +252,30 @@ PËRGJIGJJA:"""
         )
         
         if response.status_code == 200:
-            data = response.json()
-            return data["choices"][0]["message"]["content"].strip()
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
         else:
-            raise Exception(f"Groq API error: {response.status_code} - {response.text}")
+            error_msg = f"Groq API error: {response.status_code}"
+            print(error_msg)
+            return f"Na vjen keq, ndodhi një gabim: {error_msg}"
     
     def _gemini_request(self, prompt: str) -> str:
         """Make request to Google Gemini API"""
         if not self.gemini_model:
-            raise Exception("Gemini model not initialized")
-        
-        try:
-            # Configure generation settings for legal content
-            generation_config = genai.types.GenerationConfig(
-                candidate_count=1,
-                max_output_tokens=2048,
-                temperature=0.3,
-                top_p=0.8,
-                top_k=40
-            )
+            return self._fallback_response("", [])
             
-            # Generate response using Gemini
+        try:
             response = self.gemini_model.generate_content(
                 prompt,
-                generation_config=generation_config
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.2,
+                    max_output_tokens=1000,
+                )
             )
-            
-            if response.text:
-                return response.text.strip()
-            else:
-                raise Exception("Empty response from Gemini")
-                
+            return response.text
         except Exception as e:
-            raise Exception(f"Gemini API error: {str(e)}")
+            print(f"Gemini API error: {e}")
+            return f"Na vjen keq, ndodhi një gabim me Gemini API: {e}"
     
     def _huggingface_request(self, prompt: str) -> str:
         """Make request to Hugging Face API"""
@@ -258,119 +301,48 @@ PËRGJIGJJA:"""
         )
         
         if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, list) and len(data) > 0:
-                return data[0].get("generated_text", "").strip()
-            else:
-                return str(data)
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                return result[0].get('generated_text', 'Nuk u gjend përgjigje.')
+            return 'Përgjigje e pavlefshme nga API.'
         else:
-            raise Exception(f"HuggingFace API error: {response.status_code}")
+            return f"Gabim API: {response.status_code}"
     
     def _fallback_response(self, query: str, relevant_docs: List[Dict]) -> str:
-        """Fallback response when cloud LLM is not available"""
-        
+        """Provide template-based fallback response"""
         if not relevant_docs:
-            return """❌ **Nuk u gjetën dokumente relevante**
-            
-Ju lutem provoni:
-• Përdorni fjalë kyçe të tjera
-• Bëni pyetjen më të qartë
-• Kontrolloni drejtshkrimin
+            return """
+🏛️ **Sistemi Ligjor Shqiptar - Informacion i Përgjithshëm**
 
-⚖️ Për këshilla ligjore të detajuara, konsultohuni me një jurist të kualifikuar."""
+Na vjen keq, nuk gjeta dokumente specifike për pyetjen tuaj. Ja disa sugjerime:
+
+📚 **Për informacion të detajuar ligjor:**
+- Vizitoni faqen zyrtare: qbz.gov.al
+- Kontaktoni një jurist të kualifikuar
+- Konsultohuni me Dhomën e Avokatisë së Shqipërisë
+
+⚖️ **Sistemi ligjor shqiptar bazohet në:**
+- Kushtetutën e Republikës së Shqipërisë
+- Kodet e ndryshme (Penal, Civil, Pune, etj.)
+- Ligjet e veçanta të miratuara nga Kuvendi
+
+**Kujdes:** Ky është vetëm një sistem i përgjithshëm këshillimi. Për çështje të rëndësishme ligjore, rekomandohet konsultimi me ekspertë ligjorë.
+            """
         
-        # Check for specific query types
-        vacation_keywords = ['pushim', 'pushimi', 'vacation', 'leave', 'dit']
-        if any(keyword in query.lower() for keyword in vacation_keywords):
-            return """🏖️ **Pushimi Vjetor në Shqipëri**
-
-Sipas Kodit të Punës së Shqipërisë:
-• 📅 **Total**: 28 ditë kalendarike në vit
-• ⚠️ **Të detyrueshme**: 14 ditë që duhet të merren gjatë vitit
-• 🔄 **Opsionale**: 14 ditë të tjera mund të transferohen
-• 💰 **Me pagesë**: Po, pushimi është me pagesë të plotë
-
-📚 **Burim**: Kodi i Punës i Shqipërisë
-⚖️ **Shënim**: Për detaje të mëtejshme, konsultohuni me një jurist."""
-        
-        business_keywords = ['biznes', 'themeloj', 'business', 'shoqëri', 'regjistro']
-        if any(keyword in query.lower() for keyword in business_keywords):
-            return """🏢 **Themelimi i Biznesit në Shqipëri**
-
-Sipas ligjit shqiptar për biznesin:
-• 📋 **Regjistrimi**: Qendra Kombëtare e Biznesit
-• 📄 **Dokumentet**: Statutet, aktet themelore
-• 💼 **Format**: SH.P.K, SHA, Kooperativë, etj.
-• ⏱️ **Kohëzgjatja**: Disa ditë pune
-
-📚 **Burim**: Ligji për Biznesin në Shqipëri
-⚖️ **Shënim**: Për procedura të detajuara, konsultohuni me një jurist."""
-        
-        # General response
-        response = "📋 **Përgjigje bazuar në dokumentet ligjore shqiptare:**\n\n"
+        # If we have documents, provide a basic summary
+        response = "🏛️ **Informacion nga Dokumentet Ligjore**\n\n"
         
         for i, doc in enumerate(relevant_docs[:2], 1):
-            doc_type = "🌐" if doc.get('document_type') == 'scraped_legal_document' else "📚"
-            response += f"{doc_type} **{doc['title']}** (Relevanca: {doc.get('similarity', 0):.2f})\n"
-            response += f"📄 {doc['content'][:200]}...\n\n"
+            response += f"**{i}. {doc['title']}**\n"
+            response += f"{doc['content'][:300]}...\n\n"
         
-        response += "⚖️ **Shënim**: Ky informacion është për qëllime informuese. "
-        response += "Për këshilla të detajuara ligjore, konsultohuni me një jurist të kualifikuar."
+        response += "\n⚖️ **Rekomandim:** Për interpretim të saktë ligjor, konsultohuni me një jurist të kualifikuar."
         
         return response
-    
-    def test_connection(self) -> bool:
-        """Test if the cloud LLM connection works"""
-        try:
-            test_query = "Test"
-            test_docs = [{
-                'title': 'Test Document',
-                'content': 'This is a test document.',
-                'document_type': 'hardcoded'
-            }]
-            
-            response = self.generate_response(test_query, test_docs)
-            return len(response) > 10  # Basic check
-            
-        except Exception as e:
-            print(f"❌ Connection test failed: {e}")
-            return False
 
 
-def main():
-    """Test the cloud LLM integration"""
-    print("🌐 Testing Cloud LLM Integration")
-    print("=" * 50)
-    
-    # Initialize client
-    client = CloudLLMClient("groq")
-    print(f"✅ Client initialized for {client.provider}")
-    print(f"🔑 API Key: {'✅ Available' if client.api_key else '❌ Missing'}")
-    print(f"🤖 Model: {client.model}")
-    
-    # Test connection
-    print("\n🔍 Testing connection...")
-    if client.test_connection():
-        print("✅ Connection successful!")
-    else:
-        print("❌ Connection failed, will use fallback responses")
-    
-    # Test with Albanian legal query
-    print("\n📋 Testing with Albanian legal query...")
-    test_query = "Sa dit pushimi kam në punë të detyrueshme?"
-    test_docs = [{
-        'title': 'Kodi i Punës - Labor Code',
-        'content': 'Kodi i Punës rregullon marrëdhëniet e punës, të drejtat dhe detyrimet e punëdhënësve dhe të punësuarve. Çdo punëtor ka të drejtë për pushim vjetor me pagesë. Pushimi vjetor është gjithsej 28 ditë kalendarike në vit.',
-        'document_type': 'hardcoded',
-        'similarity': 0.85
-    }]
-    
-    print(f"❓ Query: {test_query}")
-    response = client.generate_response(test_query, test_docs)
-    print(f"\n💬 Response:\n{response}")
-    
-    print("\n🎉 Cloud LLM integration test completed!")
-
-
-if __name__ == "__main__":
-    main()
+# Helper functions for backward compatibility
+def generate_enhanced_response(query: str, relevant_docs: List[Dict], context: str = "") -> str:
+    """Legacy function for backward compatibility"""
+    client = CloudLLMClient("gemini")
+    return client.generate_response(query, relevant_docs, context)

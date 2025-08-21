@@ -108,3 +108,21 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+
+# Old duplicate files (cleaned up in modular refactor)
+app_old.py
+ai_old.py
+api_old.py
+scraper_old.py
+setup_old.py
+demo*.py
+quick_*.py
+test_individual_*.py
+performance_*.py
+*_old.*
+
+# Analysis and summary files
+*SUMMARY.md
+*ANALYSIS.md
+PRESENTATION.md
+performance_results_*.json
