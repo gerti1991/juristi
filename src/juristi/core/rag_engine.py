@@ -752,8 +752,15 @@ class AlbanianLegalRAG:
         cache_file = self.google_cache_file if self.use_google_embeddings else "document_embeddings_cache.json"
         
         try:
+            # Convert numpy array to list for JSON serialization
+            import numpy as np
+            if isinstance(self.document_embeddings, np.ndarray):
+                embeddings_list = self.document_embeddings.tolist()
+            else:
+                embeddings_list = self.document_embeddings
+                
             cache = {
-                'embeddings': self.document_embeddings.tolist(),
+                'embeddings': embeddings_list,
                 'timestamp': time.time(),
                 'document_count': len(self.legal_documents)
             }
