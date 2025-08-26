@@ -57,6 +57,10 @@ chroma_db/
 legal_documents/processed/
 *.pickle
 
+# Legal documents - large PDF files
+legal_documents/pdfs/
+*.pdf
+
 # Logs
 *.log
 logs/
