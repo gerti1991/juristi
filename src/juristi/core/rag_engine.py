@@ -1,1362 +1,1492 @@
 """
-Core RAG Engine for Albanian Legal Research System
+Modern Albanian Legal RAG Engine using LangChain with Multiple Embedding Providers
 
-This module contains the main RAG engine extracted and refactored from the original app.py.
-Provides document retrieval, embedding generation, and search functionality.
+This module provides a modern RAG implementation supporting:
+- Google Generative AI embeddings (embedding-001) - Priority 1
+- BGE Small English embeddings for better Albanian language understanding - Priority 2  
+- Sentence Transformers embeddings (all-MiniLM-L6-v2) - Priority 3 (fallback)
+- Google Gemini 2.5 Flash for efficient LLM responses
+- LangChain for advanced retrieval with MMR
+- ChromaDB for vector storage
+- Optimized for Albanian/English legal documents
 """
 
 import os
 import json
 import time
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import TfidfVectorizer
+import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Any
-from dotenv import load_dotenv
-import google.generativeai as genai
+from pathlib import Path
 
-# Local imports - adjust based on package structure
-from .llm_client import CloudLLMClient
-from ..data.processing import AlbanianLegalScraper
+# LangChain imports with updated community imports
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+from langchain_community.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
+from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
+
+# Multiple embedding providers with error handling
+try:
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+    GOOGLE_GENAI_AVAILABLE = True
+except ImportError:
+    GOOGLE_GENAI_AVAILABLE = False
+    GoogleGenerativeAIEmbeddings = None
+    ChatGoogleGenerativeAI = None
+
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+    HUGGINGFACE_AVAILABLE = True
+except ImportError:
+    try:
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        HUGGINGFACE_AVAILABLE = True
+    except ImportError:
+        HUGGINGFACE_AVAILABLE = False
+        HuggingFaceEmbeddings = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+
+# Environment and utilities
+from dotenv import load_dotenv
+import streamlit as st
 
 # Load environment variables
 load_dotenv()
 
-# Set environment variables for PyTorch compatibility
-os.environ['TORCH_SHOW_CPP_STACKTRACES'] = '0'
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+# Setup logging
+logger = logging.getLogger(__name__)
+
+
+class DimensionNormalizedEmbeddings:
+    """
+    Wrapper class to normalize all embeddings to 384 dimensions for ChromaDB compatibility.
+    Uses PCA for dimensionality reduction when needed.
+    """
+    
+    def __init__(self, base_embeddings, target_dimension: int = 384):
+        self.base_embeddings = base_embeddings
+        self.target_dimension = target_dimension
+        self._pca_reducer = None
+        self._needs_reduction = None
+        
+    def _check_dimension_and_setup_reducer(self, embeddings):
+        """Check if we need dimension reduction and set up PCA if needed."""
+        if self._needs_reduction is None:
+            original_dim = len(embeddings[0]) if isinstance(embeddings[0], list) else embeddings.shape[1]
+            self._needs_reduction = original_dim > self.target_dimension
+            
+            if self._needs_reduction:
+                try:
+                    from sklearn.decomposition import PCA
+                    import numpy as np
+                    
+                    # Initialize PCA reducer
+                    self._pca_reducer = PCA(n_components=self.target_dimension, random_state=42)
+                    
+                    # Fit on current embeddings
+                    embeddings_array = np.array(embeddings)
+                    self._pca_reducer.fit(embeddings_array)
+                    
+                    logger.info(f"🔧 PCA reducer initialized: {original_dim} → {self.target_dimension} dimensions")
+                    
+                except ImportError:
+                    logger.warning("⚠️ scikit-learn not available for PCA - using truncation instead")
+                    self._pca_reducer = None
+                    
+        return self._needs_reduction
+    
+    def _normalize_embeddings(self, embeddings):
+        """Normalize embeddings to target dimension."""
+        import numpy as np
+        embeddings_array = np.array(embeddings)
+        
+        if not self._check_dimension_and_setup_reducer(embeddings_array):
+            # No reduction needed
+            return embeddings_array.tolist()
+        
+        # Apply dimension reduction
+        if self._pca_reducer is not None:
+            # Use PCA for intelligent dimension reduction
+            reduced = self._pca_reducer.transform(embeddings_array)
+            return reduced.tolist()
+        else:
+            # Fallback: simple truncation
+            return embeddings_array[:, :self.target_dimension].tolist()
+    
+    def embed_documents(self, texts):
+        """Embed documents with dimension normalization."""
+        embeddings = self.base_embeddings.embed_documents(texts)
+        return self._normalize_embeddings(embeddings)
+    
+    def embed_query(self, text):
+        """Embed query with dimension normalization."""
+        embedding = self.base_embeddings.embed_query(text)
+        if isinstance(embedding, list) and len(embedding) > self.target_dimension:
+            if self._pca_reducer is not None:
+                import numpy as np
+                # For single queries, we need to reshape for PCA
+                embedding_array = np.array([embedding])
+                reduced = self._pca_reducer.transform(embedding_array)
+                return reduced[0].tolist()
+            else:
+                # Simple truncation
+                return embedding[:self.target_dimension]
+        return embedding
 
 
 class AlbanianLegalRAG:
     """
-    Advanced Albanian Legal RAG System with multiple retrieval strategies.
+    Modern Albanian Legal RAG System using LangChain with Multiple Embedding Providers.
     
     Features:
-    - Hybrid retrieval (dense + sparse)
-    - Hierarchical RAG
-    - Sentence-window RAG
-    - Lazy loading for quick startup
-    - Google embeddings integration
-    - Advanced document processing
+    - Priority-based embedding providers: Google -> BGE -> SentenceTransformers
+    - Google Gemini 2.5 Flash LLM for efficient responses
+    - MMR retrieval for better chunk diversity
+    - ChromaDB for vector storage
+    - Session state management
+    - Memory for conversation history
     """
     
-    def __init__(self, quick_start: bool = None, rag_mode: str = None, 
-                 use_google_embeddings: bool = None, hybrid_alpha: float = None):
+    def __init__(self, 
+                 persist_directory: str = "chroma_db",
+                 verbose: bool = True,
+                 ui_only: bool = False):
         """
-        Initialize the RAG system with configurable startup mode.
+        Initialize the modern RAG system with multiple embedding providers.
         
         Args:
-            quick_start: Enable quick startup (lazy loading)
-            rag_mode: RAG mode ('traditional', 'hierarchical', 'sentence_window')
-            use_google_embeddings: Whether to use Google embeddings
-            hybrid_alpha: Balance between dense and sparse retrieval
+            persist_directory: Directory for ChromaDB persistence
+            verbose: Enable verbose logging
+            ui_only: If True, only load existing ChromaDB without embedding initialization
         """
+        self.persist_directory = persist_directory
+        self.verbose = verbose
+        self.ui_only = ui_only
         
-        # Configuration from environment or parameters
-        if quick_start is None:
-            quick_start = os.getenv("RAG_QUICK_START", "0") == "1"
-        self.quick_start = quick_start
+        # Document tracking for incremental loading
+        self.document_index_file = os.path.join(persist_directory, "document_index.json")
+        self.processed_documents = self._load_document_index()
         
-        # Core configuration
-        self.similarity_threshold = float(os.getenv('SIMILARITY_THRESHOLD', '0.15'))
-        self.max_context_length = int(os.getenv('MAX_CONTEXT_LENGTH', '4000'))
-        self.max_chunks_to_return = int(os.getenv('MAX_CHUNKS_TO_RETURN', '5'))
+        # Configuration from environment
+        self.embedding_provider = os.getenv("EMBEDDING_PROVIDER", "google").lower()
+        self.google_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        self.google_embedding_model = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/embedding-001")
+        self.bge_embedding_model = os.getenv("BGE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+        self.fallback_embedding_model = os.getenv("FALLBACK_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        self.llm_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.device = os.getenv("DEVICE", "auto")
         
-        # Embedding configuration
-        if use_google_embeddings is None:
-            use_google_embeddings = os.getenv('USE_GOOGLE_EMBEDDINGS', '1') == '1'
-        self.use_google_embeddings = use_google_embeddings
-        
-        self.model_name = 'all-MiniLM-L6-v2'  # Fallback model
-        self.model = None
-        self.gemini_api_key = None
-        
-        # Document storage and processing
-        self.legal_documents = []
-        self.chunks = []  # Text chunks for search
-        self.document_embeddings = None
-        self.superchunk_chars = int(os.getenv('RAG_SUPERCHUNK_CHARS', '4500'))
-        self.superchunk_overlap = int(os.getenv('RAG_SUPERCHUNK_OVERLAP', '500'))
-        
-        # Retrieval configuration
-        if hybrid_alpha is None:
-            hybrid_alpha = float(os.getenv('RAG_HYBRID_ALPHA', '0.5'))
-        self.hybrid_alpha = hybrid_alpha
-        
-        self.similarity_threshold = float(os.getenv('SIMILARITY_THRESHOLD', '0.15'))
-        self.mmr_lambda = float(os.getenv('RAG_MMR_LAMBDA', '0.5'))
-        self.neighbor_expansion = int(os.getenv('RAG_NEIGHBOR_EXPANSION', '1'))
-        self.context_packing = os.getenv('RAG_CONTEXT_PACKING', '1') == '1'
-        
-        # Advanced RAG modes
-        if rag_mode is None:
-            rag_mode = os.getenv('RAG_MODE', 'traditional')
-        self.rag_mode = rag_mode
-        
-        self.sentence_window_size = int(os.getenv('RAG_SENTENCE_WINDOW_SIZE', '5'))
-        self.hierarchical_top_docs = int(os.getenv('RAG_HIERARCHICAL_TOP_DOCS', '2'))
-        
-        # Sparse retrieval components
-        self.tfidf_vectorizer = None
-        self.tfidf_matrix = None
-        
-        # Advanced data structures
-        self.document_summaries = []
-        self.document_summary_embeddings = None
-        self.sentences = []
-        self.sentence_embeddings = None
-        self.sentence_to_chunk_map = {}
-        
-        # Components
-        self.scraper = None
-        self.cloud_llm = None
-        self.google_api = None
-        
-        # Memory and caching
-        self.memory_store = {}
-        self.embeddings_cache_file = 'document_embeddings_cache_google.json'
-        self.google_cache_file = 'document_embeddings_cache_google.json'  # Alias for compatibility
-        
-        # State tracking
-        self._components_initialized = False
-        self._documents_loaded = False
-        self._embeddings_ready = False
-        
-        # Initialize components based on startup mode
-        if not self.quick_start:
-            # Full initialization
-            self._setup_google_api()
-            self._load_fallback_model()
-            self._load_cloud_llm()
-            self._initialize_scraper()
-            self._load_all_documents()
-            self._generate_embeddings()
-            self._documents_loaded = True
-            self._google_api_setup = True
-            self._cloud_llm_loaded = True
+        # Initialize components based on mode
+        if self.ui_only:
+            # UI-only mode: Skip embedding initialization, only load existing vectorstore and LLM
+            self.embeddings = None
+            self.active_embedding_provider = "unknown"
+            self._initialize_llm()
+            self._initialize_memory() 
+            self._try_load_existing_vectorstore_ui_only()
         else:
-            # Minimal initialization for quick start
-            self.legal_documents = []
-            self.use_google_embeddings = False  # Will be determined later
-            self.cloud_llm = None
-            self._documents_loaded = False
-            self._google_api_setup = False
-            self._cloud_llm_loaded = False
+            # Full mode: Initialize everything including embeddings
+            self._initialize_embeddings()
+            self._initialize_llm()
+            self._initialize_text_splitter()
+            self._initialize_vectorstore()
+            self._initialize_memory()
+            self._initialize_chain()
         
-        # Advanced structures flag
-        self._advanced_structures_initialized = False
+        # Document tracking
+        self.documents_loaded = False
+        self.total_documents = 0
+        
+        if self.verbose:
+            mode = "UI-only" if self.ui_only else "Full"
+            logger.info(f"✅ Modern Albanian Legal RAG System initialized ({mode} mode)")
     
-    # ================================
-    # COMPONENT INITIALIZATION
-    # ================================
-    
-    def _setup_google_api(self):
-        """Setup Google API for embeddings."""
-        # Skip entirely in quick start mode during initial load
-        if self.quick_start and not getattr(self, '_google_api_setup', False):
-            return
-            
+    def _try_load_existing_vectorstore_ui_only(self):
+        """Load existing ChromaDB for UI-only mode without embedding initialization."""
         try:
-            self.gemini_api_key = os.getenv("GEMINI_API_KEY")
-            print(f"🔑 GEMINI_API_KEY found: {'Yes' if self.gemini_api_key else 'No'}")
-            if self.gemini_api_key:
-                print(f"   Key starts with: {self.gemini_api_key[:10]}...")
-                # Import and initialize Google API
-                try:
-                    import google.generativeai as genai
-                    genai.configure(api_key=self.gemini_api_key)
-                    print("✅ Google Generative AI configured successfully")
-                    
-                    # Create a simple wrapper for the Google embeddings API
-                    class GoogleEmbeddingsAPI:
-                        def __init__(self, api_key):
-                            self.api_key = api_key
-                            import google.generativeai as genai
-                            genai.configure(api_key=api_key)
-                        
-                        def get_embeddings(self, texts):
-                            """Get embeddings for a list of texts."""
-                            try:
-                                import google.generativeai as genai
-                                embeddings = []
-                                
-                                # Test with first text to validate API
-                                print(f"🔍 Testing Google API with {len(texts)} texts...")
-                                if len(texts) > 0:
-                                    print(f"   First text preview: {texts[0][:100]}...")
-                                
-                                for i, text in enumerate(texts):
-                                    if i == 0 or (i + 1) % 100 == 0 or i == len(texts) - 1:
-                                        print(f"   Processing text {i+1}/{len(texts)}")
-                                    
-                                    response = genai.embed_content(
-                                        model="models/text-embedding-004",
-                                        content=text
-                                    )
-                                    embeddings.append(response['embedding'])
-                                
-                                print(f"✅ Successfully generated {len(embeddings)} Google embeddings")
-                                return embeddings
-                            except Exception as e:
-                                print(f"❌ Error getting Google embeddings: {type(e).__name__}: {e}")
-                                import traceback
-                                print(f"   Full error: {traceback.format_exc()}")
-                                return None
-                    
-                    self.google_api = GoogleEmbeddingsAPI(self.gemini_api_key)
-                    # Only enable Google embeddings if explicitly requested
-                    if self.use_google_embeddings:
-                        print("✅ Google embeddings API initialized and enabled")
-                    else:
-                        print("ℹ️  Google embeddings API initialized but disabled (use_google_embeddings=False)")
-                        
-                except ImportError as e:
-                    print(f"❌ Could not import Google Generative AI: {e}")
-                    self.google_api = None
-                except Exception as e:
-                    print(f"❌ Error initializing Google API: {type(e).__name__}: {e}")
-                    import traceback
-                    print(f"   Full error: {traceback.format_exc()}")
-                    self.google_api = None
-            else:
-                print("❌ No GEMINI_API_KEY found in environment")
-                self.google_api = None
-        except Exception as e:
-            print(f"❌ Error in Google API setup: {type(e).__name__}: {e}")
-            self.google_api = None
-        
-        # Initialize sentence transformer model (fallback and default)
-    
-    def _load_fallback_model(self):
-        """Load fallback sentence transformer model."""
-        try:
-            from sentence_transformers import SentenceTransformer
-            if not self.model:
-                print(f"🔄 Loading fallback model: {self.model_name}")
-                self.model = SentenceTransformer(self.model_name)
-                print(f"✅ Fallback model loaded successfully")
-        except ImportError:
-            print("❌ Warning: sentence_transformers not available")
-        except Exception as e:
-            print(f"❌ Warning: Could not load fallback model: {e}")
-    
-    def _load_cloud_llm(self):
-        """Initialize cloud LLM client."""
-        try:
-            self.cloud_llm = CloudLLMClient("gemini")
-        except Exception as e:
-            print(f"Warning: Cloud LLM initialization failed: {e}")
-            self.cloud_llm = None
-    
-    def _initialize_scraper(self):
-        """Initialize the document scraper."""
-        if not self.scraper:
-            try:
-                self.scraper = AlbanianLegalScraper(max_docs=10)
-            except Exception as e:
-                print(f"Warning: Scraper initialization failed: {e}")
-                self.scraper = None
-    
-    # ================================
-    # LAZY LOADING METHODS
-    # ================================
-    
-    def _ensure_all_components_ready(self):
-        """Ensure all components are loaded when needed."""
-        if self.quick_start:
-            if self.scraper is None:
-                self._initialize_scraper()
+            if not os.path.exists(self.persist_directory):
+                if self.verbose:
+                    logger.warning("⚠️ No existing ChromaDB found - UI-only mode requires pre-built embeddings")
+                self.vectorstore = None
+                self.qa_chain = None
+                return False
             
-            if not self._google_api_setup:
-                self._setup_google_api()
-                self._google_api_setup = True
+            # For UI-only mode, create a dummy embedding function that ChromaDB requires
+            # but won't actually be used since we're only querying existing embeddings
+            from langchain_community.vectorstores import Chroma
+            from langchain_community.embeddings import HuggingFaceEmbeddings
             
-            # Ensure fallback model is loaded for embeddings
-            if self.model is None:
-                self._load_fallback_model()
-            
-            if not self._cloud_llm_loaded:
-                self._load_cloud_llm()
-                self._cloud_llm_loaded = True
-            
-            if not self._documents_loaded:
-                self._load_all_documents()
-                self._documents_loaded = True
-    
-    def _ensure_documents_loaded(self):
-        """Ensure documents are loaded (lazy loading for quick start)."""
-        if not self._documents_loaded:
-            self._load_all_documents()
-            self._documents_loaded = True
-    
-    def _ensure_embeddings_ready(self):
-        """Ensure embeddings are available, generate if needed."""
-        # Try to load from cache first
-        if self._load_embeddings_cache():
-            return
-        
-        # If no cache, generate now
-        self._generate_embeddings_now()
-    
-    def _ensure_advanced_structures_initialized(self):
-        """Lazy initialization of advanced RAG structures."""
-        if self._advanced_structures_initialized:
-            return
-            
-        if self.rag_mode in ['hierarchical', 'sentence_window']:
-            try:
-                if self.rag_mode == 'hierarchical':
-                    self._build_hierarchical_structures()
-                elif self.rag_mode == 'sentence_window':
-                    self._build_sentence_structures()
-                    
-                self._advanced_structures_initialized = True
-            except Exception as e:
-                print(f"Warning: Could not initialize advanced structures: {e}")
-    
-    # ================================
-    # DOCUMENT LOADING
-    # ================================
-    
-    def _load_all_documents(self):
-        """Load all document sources."""
-        hardcoded = self._load_hardcoded_documents()
-        scraped = self._load_scraped_documents()
-        pdf_docs = self._load_pdf_documents()
-        
-        # Combine all documents
-        self.legal_documents = hardcoded + scraped + pdf_docs
-        
-        # Ensure IDs exist
-        for i, doc in enumerate(self.legal_documents):
-            if 'id' not in doc or not doc.get('id'):
-                prefix = (doc.get('source') or doc.get('url') or doc.get('title') or 'doc').replace(' ', '_')
-                doc['id'] = f"{prefix}_chunk_{i}"
-        
-        # Extract text chunks for search
-        self.chunks = []
-        for doc in self.legal_documents:
-            content = doc.get('content', '')
-            if content:
-                self.chunks.append(content)
-        
-        print(f"📄 Loaded {len(self.legal_documents)} documents with {len(self.chunks)} chunks")
-    
-    def _load_hardcoded_documents(self) -> List[Dict]:
-        """Load hardcoded legal documents."""
-        return [
-            {
-                "id": "family_law_1",
-                "title": "Kodi i Familjes - Martesa",
-                "content": "Martesa është bashkimi i ligjshëm i burrit dhe gruas me qëllim krijimin e familjes. Martesa lidhet para zyrtarit të gjendjes civile. Për t'u martuar duhet plotësuar kushtet: 1) Mosha minimale 18 vjeç për të dy palët 2) Pëlqimi i lirë i të dy palëve 3) Mungesa e pengesave ligjore",
-                "source": "Kodi i Familjes, Neni 7-15",
-                "document_type": "hardcoded"
-            },
-            {
-                "id": "criminal_law_1", 
-                "title": "Kodi Penal - Vrasja me dashje",
-                "content": "Vrasja me dashje dënohet me burgim jo më pak se 15 vjet. Kur vrasja kryhet: a) ndaj dy ose më shumë personave b) me mizori të veçantë c) për motive të ulta dënohet me burgim të përjetshëm ose jo më pak se 20 vjet burgim",
-                "source": "Kodi Penal, Neni 76",
-                "document_type": "hardcoded"
-            },
-            {
-                "id": "civil_law_1",
-                "title": "Kodi Civil - Pronësia",
-                "content": "E drejta e pronësisë është e drejta për të shfrytëzuar, administruar dhe disponuar lirisht me gjënë. Pronari mund të kërkojë nga çdo person kthimin e gjësë së tij dhe eliminimin e çdo pengese të paligjshme për ushtrimin e së drejtës së pronësisë",
-                "source": "Kodi Civil, Neni 159",
-                "document_type": "hardcoded"
-            }
-        ]
-    
-    def _load_scraped_documents(self) -> List[Dict]:
-        """Load scraped documents."""
-        if not self.scraper:
-            return []
-            
-        try:
-            scraped_docs = self.scraper.get_processed_documents_for_rag()
-            # Merge to super-chunks
-            merged = self._to_superchunks(scraped_docs, self.superchunk_chars, self.superchunk_overlap)
-            return merged
-        except Exception as e:
-            print(f"Warning: Could not load scraped documents: {e}")
-            return []
-    
-    def _load_pdf_documents(self) -> List[Dict]:
-        """Load processed PDF documents."""
-        try:
-            # Try enhanced documents first if in advanced mode
-            enhanced_file = os.path.join("legal_documents", "pdf_rag_documents_advanced.json")
-            traditional_file = os.path.join("legal_documents", "pdf_rag_documents.json")
-            
-            if self.rag_mode in ['hierarchical', 'sentence_window'] and os.path.exists(enhanced_file):
-                return self._load_enhanced_pdf_documents(enhanced_file)
-            elif os.path.exists(traditional_file):
-                return self._load_traditional_pdf_documents(traditional_file)
-            else:
-                return []
-        except Exception as e:
-            print(f"Warning: Could not load PDF documents: {e}")
-            return []
-    
-    def _load_traditional_pdf_documents(self, file_path: str) -> List[Dict]:
-        """Load traditional PDF documents."""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                docs = json.load(f)
-            
-            # Convert to expected format
-            normalized_docs = []
-            for i, doc in enumerate(docs):
-                normalized_doc = {
-                    'id': doc.get('id', f'pdf_{i}'),
-                    'title': doc.get('title', 'PDF Document'),
-                    'content': doc.get('content', ''),
-                    'source': doc.get('source_url', doc.get('source', 'PDF')),
-                    'document_type': doc.get('document_type', 'local_pdf'),
-                    'filename': doc.get('filename', '')
-                }
-                normalized_docs.append(normalized_doc)
-            
-            print(f"📄 Loaded {len(normalized_docs)} traditional PDF documents")
-            
-            # Don't merge into super-chunks for traditional documents to preserve original structure
-            return normalized_docs
-            
-        except Exception as e:
-            print(f"Warning: Could not load traditional PDF documents: {e}")
-            return []
-    
-    def _load_enhanced_pdf_documents(self, file_path: str) -> List[Dict]:
-        """Load enhanced PDF documents with hierarchical data."""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                enhanced_docs = json.load(f)
-            
-            # Store hierarchical data for advanced RAG modes
-            self.hierarchical_data = enhanced_docs
-            
-            # Extract traditional chunks for main document list
-            normalized_docs = []
-            for doc_data in enhanced_docs:
-                chunks = doc_data.get('chunks', [])
-                for chunk in chunks:
-                    normalized_doc = {
-                        'id': chunk.get('chunk_id', f'enhanced_{len(normalized_docs)}'),
-                        'title': f"{doc_data.get('title', 'PDF Document')} - Part {chunk.get('chunk_index', 1)}",
-                        'content': chunk.get('content', ''),
-                        'source': doc_data.get('source', 'Enhanced PDF'),
-                        'document_type': 'enhanced_pdf',
-                        'parent_doc': doc_data.get('title', ''),
-                        'chunk_index': chunk.get('chunk_index', 0)
-                    }
-                    normalized_docs.append(normalized_doc)
-            
-            return normalized_docs
-            
-        except Exception as e:
-            print(f"Warning: Could not load enhanced PDF documents: {e}")
-            return []
-    
-    # ================================
-    # UTILITY METHODS
-    # ================================
-    
-    def _to_superchunks(self, documents: List[Dict], chars_per_chunk: int, overlap_chars: int) -> List[Dict]:
-        """Merge small documents into larger super-chunks."""
-        if not documents:
-            return []
-        
-        superchunks = []
-        current_chunk = {
-            'id': f'superchunk_{len(superchunks)}',
-            'title': '',
-            'content': '',
-            'source': 'Merged',
-            'document_type': 'superchunk',
-            'merged_from': []
-        }
-        current_length = 0
-        
-        for doc in documents:
-            doc_content = doc.get('content', '')
-            doc_length = len(doc_content)
-            
-            # If adding this doc would exceed limit, finalize current chunk
-            if current_length + doc_length > chars_per_chunk and current_length > 0:
-                superchunks.append(current_chunk)
-                
-                # Start new chunk with overlap
-                overlap_text = current_chunk['content'][-overlap_chars:] if overlap_chars > 0 else ''
-                current_chunk = {
-                    'id': f'superchunk_{len(superchunks)}',
-                    'title': '',
-                    'content': overlap_text,
-                    'source': 'Merged',
-                    'document_type': 'superchunk',
-                    'merged_from': []
-                }
-                current_length = len(overlap_text)
-            
-            # Add document to current chunk
-            if current_chunk['title']:
-                current_chunk['title'] += ' + ' + doc.get('title', '')
-            else:
-                current_chunk['title'] = doc.get('title', '')
-            
-            current_chunk['content'] += ' ' + doc_content
-            current_chunk['merged_from'].append(doc.get('id', ''))
-            current_length += doc_length + 1  # +1 for space
-        
-        # Don't forget the last chunk
-        if current_length > 0:
-            superchunks.append(current_chunk)
-        
-        return superchunks
-    
-    # ================================
-    # SEARCH INTERFACE
-    # ================================
-    
-    def search_documents(self, query: str, top_k: int = 3, mode: str = 'hybrid', 
-                        session_id: Optional[str] = None, multi_query: bool = True) -> List[Dict]:
-        """
-        Search for relevant documents using various retrieval strategies.
-        
-        Args:
-            query: User query
-            top_k: Number of documents to return
-            mode: Retrieval mode ('hybrid', 'embedding', 'sparse', 'hierarchical', 'sentence_window')
-            session_id: Optional conversation ID for context
-            multi_query: Whether to use query expansion
-            
-        Returns:
-            List of relevant documents with metadata
-        """
-        # Ensure all components are ready (lazy loading)
-        self._ensure_all_components_ready()
-        
-        # Ensure embeddings are ready
-        if self.document_embeddings is None:
-            self._ensure_embeddings_ready()
-            
-        if self.document_embeddings is None or len(self.legal_documents) == 0:
-            return []
-        
-        # Ensure advanced structures are initialized if needed
-        self._ensure_advanced_structures_initialized()
-        
-        # Route to appropriate search method based on RAG mode
-        if self.rag_mode == 'hierarchical':
-            return self._search_hierarchical(query, top_k, session_id, multi_query)
-        elif self.rag_mode == 'sentence_window':
-            return self._search_sentence_window(query, top_k, session_id, multi_query)
-        else:
-            # Traditional hybrid/embedding/sparse search
-            return self._search_traditional(query, top_k, mode, session_id, multi_query)
-    
-    def generate_response(self, query: str, max_results: int = 3) -> str:
-        """Generate a comprehensive response to a legal query."""
-        # Search for relevant documents
-        results = self.search_documents(query, top_k=max_results)
-        
-        if not self.cloud_llm:
-            # Fallback response
-            if results:
-                response = f"📚 **Dokumentet e gjetur për: {query}**\n\n"
-                for i, doc in enumerate(results, 1):
-                    response += f"**{i}. {doc['title']}**\n{doc['content'][:300]}...\n\n"
-                return response
-            else:
-                return "Nuk u gjetën dokumente relevante për pyetjen tuaj."
-        
-        # Use cloud LLM for enhanced response
-        try:
-            return self.cloud_llm.generate_response(query, results)
-        except Exception as e:
-            print(f"Warning: LLM response generation failed: {e}")
-            # Fallback to simple response
-            if results:
-                return f"Gjeta {len(results)} dokumente relevante, por nuk mund të gjeneroj përgjigje të detajuar."
-            else:
-                return "Nuk u gjetën dokumente relevante."
-
-
-    # ================================
-    # EMBEDDING METHODS
-    # ================================
-    
-    def _generate_embeddings(self):
-        """Generate embeddings with quick start check."""
-        if self.quick_start:
-            return
-        self._generate_embeddings_now()
-    
-    def _generate_embeddings_now(self):
-        """Force generate embeddings (bypasses quick start check)"""
-        if not self.use_google_embeddings and not self.model:
-            print("❌ No embedding model available - cannot generate embeddings")
-            return
-        
-        if not self.legal_documents:
-            print("❌ No documents loaded - cannot generate embeddings")
-            return
-        
-        # Try to load from cache first
-        if self._load_embeddings_cache():
-            return
-        
-        try:
-            if self.use_google_embeddings:
-                print("🔄 Generating Google embeddings for better Albanian legal search...")
-                
-                # Prepare document texts with enhanced content
-                document_texts = []
-                for doc in self.legal_documents:
-                    # Combine title and content for better context
-                    enhanced_text = f"Dokument ligjor: {doc['title']}. Përmbajtja: {doc['content']}"
-                    if doc.get('content_en'):
-                        enhanced_text += f" English: {doc['content_en']}"
-                    document_texts.append(enhanced_text)
-                
-                # Generate Google embeddings
-                self.document_embeddings = self._get_google_embeddings(document_texts)
-                
-                if self.document_embeddings is None:
-                    print("❌ Failed to generate Google embeddings - falling back to local model")
-                    # Fallback to local model
-                    if self.model:
-                        print(f"🔄 Generating embeddings for {len(document_texts)} documents with local model...")
-                        # Process in batches for large datasets to avoid memory issues
-                        batch_size = 100
-                        all_embeddings = []
-                        
-                        for i in range(0, len(document_texts), batch_size):
-                            batch = document_texts[i:i+batch_size]
-                            print(f"   Processing batch {i//batch_size + 1}/{(len(document_texts)-1)//batch_size + 1} ({len(batch)} documents)")
-                            batch_embeddings = self.model.encode(batch)
-                            all_embeddings.append(batch_embeddings)
-                        
-                        import numpy as np
-                        self.document_embeddings = np.vstack(all_embeddings)
-                        print(f"✅ Generated {len(self.document_embeddings)} document embeddings")
-                    else:
-                        print("❌ No local model available for fallback")
-                        return
-                else:
-                    # Convert Google embeddings list to numpy array
-                    import numpy as np
-                    self.document_embeddings = np.array(self.document_embeddings)
-                    print(f"✅ Successfully generated {len(self.document_embeddings)} Google embeddings (converted to numpy array)")
-            else:
-                # Use local SentenceTransformer model
-                print(f"🔄 Generating embeddings with local model for {len(self.legal_documents)} documents...")
-                
-                document_texts = [f"{doc['title']}. {doc['content']}" for doc in self.legal_documents]
-                
-                # Process in batches for large datasets
-                batch_size = 100
-                all_embeddings = []
-                
-                for i in range(0, len(document_texts), batch_size):
-                    batch = document_texts[i:i+batch_size]
-                    print(f"   Processing batch {i//batch_size + 1}/{(len(document_texts)-1)//batch_size + 1} ({len(batch)} documents)")
-                    batch_embeddings = self.model.encode(batch)
-                    all_embeddings.append(batch_embeddings)
-                
-                import numpy as np
-                self.document_embeddings = np.vstack(all_embeddings)
-                print(f"✅ Generated {len(self.document_embeddings)} local embeddings")
-            
-            # Save to cache for future use
-            self._save_embeddings_cache()
-            
-            # Generate TF-IDF matrix for hybrid search
-            self._generate_tfidf_matrix()
-            
-        except Exception as e:
-            print(f"❌ Error generating embeddings: {e}")
-    
-    def _ensure_embeddings_ready(self):
-        """Ensure embeddings are available, generate if needed"""
-        if self.document_embeddings is None:
-            print("🔄 First search - generating embeddings...")
-            self._generate_embeddings_now()
-    
-    def _get_google_embeddings(self, texts: List[str]):
-        """Generate embeddings using Google's API."""
-        if not self.google_api:
-            return None
-        
-        try:
-            return self.google_api.get_embeddings(texts)
-        except Exception as e:
-            print(f"Error getting Google embeddings: {e}")
-            return None
-    
-    def _get_google_query_embedding(self, query: str):
-        """Get embedding for a single query using Google's API."""
-        embeddings = self._get_google_embeddings([query])
-        return embeddings[0] if embeddings is not None and len(embeddings) > 0 else None
-    
-    def _generate_tfidf_matrix(self):
-        """Generate TF-IDF matrix for sparse retrieval."""
-        try:
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            
-            document_texts = [doc['content'] for doc in self.legal_documents]
-            
-            self.tfidf_vectorizer = TfidfVectorizer(
-                max_features=10000,
-                stop_words=None,  # Keep Albanian stopwords
-                ngram_range=(1, 2),
-                min_df=1,
-                max_df=0.95
+            # Use a lightweight dummy embedding function for UI-only mode
+            dummy_embeddings = HuggingFaceEmbeddings(
+                model_name="all-MiniLM-L6-v2",
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
             )
             
-            self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(document_texts)
-            print("✅ Generated TF-IDF matrix for hybrid search")
+            # Load with dummy embedding function - ChromaDB requires this even for queries
+            self.vectorstore = Chroma(
+                persist_directory=self.persist_directory,
+                embedding_function=dummy_embeddings
+            )
             
-        except Exception as e:
-            print(f"Warning: Could not generate TF-IDF matrix: {e}")
-            self.tfidf_vectorizer = None
-            self.tfidf_matrix = None
-    
-    def _load_embeddings_cache(self) -> bool:
-        """Load embeddings from cache file."""
-        cache_file = self.google_cache_file if self.use_google_embeddings else "document_embeddings_cache.json"
-        
-        if not os.path.exists(cache_file):
-            return False
-        
-        try:
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                cache = json.load(f)
-            
-            # Check if cache is valid (same number of documents)
-            if len(cache.get('embeddings', [])) == len(self.legal_documents):
-                self.document_embeddings = np.array(cache['embeddings'])
-                print(f"✅ Loaded embeddings from cache: {cache_file}")
+            # Check if it has data
+            try:
+                count = self.vectorstore._collection.count()
+                if count > 0:
+                    self.total_documents = count
+                    self.documents_loaded = True
+                    
+                    # Initialize QA chain for UI-only mode
+                    self._initialize_chain_ui_only()
+                    
+                    if self.verbose:
+                        logger.info(f"✅ Loaded existing vectorstore with {count} documents (UI-only mode)")
+                    return True
+                else:
+                    if self.verbose:
+                        logger.warning("⚠️ ChromaDB exists but is empty")
+                    return False
+            except Exception as count_error:
+                if self.verbose:
+                    logger.warning(f"⚠️ Could not get document count: {count_error}")
+                # Try to initialize anyway, might still work
+                self._initialize_chain_ui_only()
                 return True
+            
         except Exception as e:
-            print(f"Warning: Could not load embeddings cache: {e}")
+            if self.verbose:
+                logger.error(f"❌ Failed to load existing vectorstore in UI-only mode: {e}")
+            self.vectorstore = None
+            self.qa_chain = None
+            return False
+            
+        return False
+    
+    def _initialize_chain_ui_only(self):
+        """Initialize QA chain for UI-only mode with existing embeddings."""
+        if self.vectorstore is not None and hasattr(self, 'llm'):
+            # Create retriever with MMR for better diversity
+            retriever = self.vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={
+                    "k": 5,
+                    "fetch_k": 20,
+                    "lambda_mult": 0.7
+                }
+            )
+            
+            # Create custom prompt template for Albanian legal questions (UI-only mode)
+            custom_prompt_template = """
+Ti jeni një ekspert juridik për legjislacionin shqiptar. Ju jepet informacion nga dokumentet ligjore dhe duhet të përgjigjeni GJITHMONË me bazë në këto dokumente.
+
+INFORMACION NGA DOKUMENTET LIGJORE:
+{context}
+
+PYETJA: {question}
+
+UDHËZIME TË DETYRUESHME:
+1. GJITHMONË jepni një përgjigje të plotë në gjuhën shqipe
+2. Përdorni VETËM informacionin e dhënë nga dokumentet e mësipërme
+3. Nëse gjeni informacion të pjesshëm, kombinojini të gjitha pjesët për të dhënë përgjigjen më të plotë të mundshme
+4. Citoni nenin/nenet e ligjit, kodin ligjor dhe faqen kur është e mundur
+5. Strukturoni përgjigjen tuaj si më poshtë:
+
+PËRGJIGJA SHQIP:
+- Filloni me një përmbledhje të shkurtër
+- Jepni detaje të plota nga dokumentet
+- Citoni burimet ligjore specifike
+- Përfundoni me një konkluzion të qartë
+
+MOS thoni kurrë "nuk e di" - përdorni informacionin që keni në dispozicion dhe jepni përgjigjen më të mirë të mundshme.
+
+PËRGJIGJA:"""
+
+            custom_prompt = PromptTemplate(
+                template=custom_prompt_template,
+                input_variables=["context", "question"]
+            )
+            
+            # Create QA chain with custom prompt
+            from langchain.chains import RetrievalQA
+            
+            self.qa_chain = RetrievalQA.from_chain_type(
+                llm=self.llm,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": custom_prompt},
+                memory=self.memory,
+                return_source_documents=True,
+                verbose=self.verbose
+            )
+            
+            if self.verbose:
+                logger.info("✅ QA chain initialized (UI-only mode)")
+        else:
+            self.qa_chain = None
+            if self.verbose:
+                logger.warning("⚠️ Cannot initialize QA chain - missing vectorstore or LLM")
+    
+    def _initialize_embeddings(self):
+        """Initialize embeddings with strict priority: Google -> BGE -> all-MiniLM-L6-v2."""
+        self.embeddings = None
+        
+        # Fixed priority order as requested
+        embedding_providers = ["google", "bge", "sentence-transformers"]
+        
+        for provider in embedding_providers:
+            try:
+                if provider == "google" and GOOGLE_GENAI_AVAILABLE and self.google_api_key:
+                    if self.verbose:
+                        logger.info("🔄 Trying Google embeddings (Priority 1)...")
+                    
+                    # Handle Streamlit event loop issues
+                    try:
+                        import asyncio
+                        # Check if we're in Streamlit environment
+                        try:
+                            asyncio.get_running_loop()
+                            # We're in an async context (likely Streamlit), skip Google for now
+                            if self.verbose:
+                                logger.warning("⚠️ Skipping Google embeddings in async environment (Streamlit)")
+                            raise Exception("Event loop conflict in Streamlit")
+                        except RuntimeError:
+                            # No event loop running, safe to use Google embeddings
+                            pass
+                    except:
+                        # If any issue with event loop detection, skip Google
+                        if self.verbose:
+                            logger.warning("⚠️ Skipping Google embeddings due to async environment")
+                        continue
+                    
+                    base_embeddings = GoogleGenerativeAIEmbeddings(
+                        model=self.google_embedding_model,
+                        google_api_key=self.google_api_key
+                    )
+                    # Wrap with dimension normalizer to ensure 384 dimensions
+                    self.embeddings = DimensionNormalizedEmbeddings(base_embeddings, target_dimension=384)
+                    self.active_embedding_provider = "google"
+                    if self.verbose:
+                        logger.info(f"✅ Google embeddings initialized: {self.google_embedding_model} (normalized to 384 dims)")
+                    break
+                    
+                elif provider == "bge" and HUGGINGFACE_AVAILABLE:
+                    if self.verbose:
+                        logger.info("🔄 Google failed, trying BGE embeddings (Priority 2)...")
+                    
+                    base_embeddings = HuggingFaceEmbeddings(
+                        model_name=self.bge_embedding_model,
+                        model_kwargs={'device': self.device}
+                    )
+                    # BGE is already 384 dims, but wrap for consistency
+                    self.embeddings = DimensionNormalizedEmbeddings(base_embeddings, target_dimension=384)
+                    self.active_embedding_provider = "bge"
+                    if self.verbose:
+                        logger.info(f"✅ BGE embeddings initialized: {self.bge_embedding_model} (384 dims)")
+                    break
+                    
+                elif provider == "sentence-transformers":
+                    if self.verbose:
+                        logger.info("🔄 Previous providers failed, using fallback embeddings (Priority 3)...")
+                    
+                    # Use SentenceTransformerEmbeddings from langchain_community
+                    from langchain_community.embeddings import SentenceTransformerEmbeddings
+                    
+                    base_embeddings = SentenceTransformerEmbeddings(
+                        model_name=self.fallback_embedding_model
+                    )
+                    # all-MiniLM-L6-v2 is already 384 dims, but wrap for consistency
+                    self.embeddings = DimensionNormalizedEmbeddings(base_embeddings, target_dimension=384)
+                    self.active_embedding_provider = "sentence-transformers"
+                    if self.verbose:
+                        logger.info(f"✅ Fallback embeddings initialized: {self.fallback_embedding_model} (384 dims)")
+                    break
+                    
+            except Exception as e:
+                if self.verbose:
+                    logger.warning(f"⚠️ Failed to initialize {provider} embeddings: {e}")
+                continue
+        
+        if self.embeddings is None:
+            raise ValueError("❌ All embedding providers failed. Please check your configuration.")
+        
+        if self.verbose:
+            logger.info(f"🎯 Active embedding provider: {self.active_embedding_provider}")
+    
+    def _initialize_llm(self):
+        """Initialize Google Gemini LLM with fallback."""
+        try:
+            if GOOGLE_GENAI_AVAILABLE and self.google_api_key:
+                self.llm = ChatGoogleGenerativeAI(
+                    model=self.llm_model,
+                    google_api_key=self.google_api_key,
+                    temperature=0.2,
+                    verbose=self.verbose,
+                    convert_system_message_to_human=True  # For better Albanian language handling
+                )
+                if self.verbose:
+                    logger.info(f"✅ Google Gemini LLM initialized: {self.llm_model}")
+            else:
+                # Fallback to a different LLM if needed
+                raise ValueError("Google Gemini LLM not available")
+        except Exception as e:
+            if self.verbose:
+                logger.warning(f"⚠️ Failed to initialize Google Gemini LLM: {e}")
+            # Could add fallback LLM here (e.g., local model)
+            raise ValueError("❌ No LLM provider available. Please check GOOGLE_API_KEY.")
+    
+    def _initialize_text_splitter(self):
+        """Initialize text splitter optimized for Albanian legal documents."""
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+            separators=["\n\n", "\n", ".", "!", "?", ";", ",", " ", ""]
+        )
+        if self.verbose:
+            logger.info("✅ Text splitter initialized")
+    
+    def _initialize_vectorstore(self):
+        """Initialize vectorstore - will be created when documents are loaded."""
+        self.vectorstore = None
+        if self.verbose:
+            logger.info("📝 ChromaDB will be created when documents are loaded")
+    
+    def _initialize_memory(self):
+        """Initialize conversation memory."""
+        self.memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True,
+            output_key="result"
+        )
+        if self.verbose:
+            logger.info("✅ Conversation memory initialized")
+    
+    def _load_document_index(self) -> Dict[str, Dict]:
+        """Load document index for tracking processed documents."""
+        if os.path.exists(self.document_index_file):
+            try:
+                with open(self.document_index_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                if self.verbose:
+                    logger.warning(f"⚠️ Could not load document index: {e}")
+                return {}
+        return {}
+    
+    def rebuild_document_index(self, documents_path: str = "legal_documents/pdfs"):
+        """
+        Rebuild document index from existing PDF files.
+        This is useful when the index was lost but documents were already processed.
+        """
+        try:
+            pdf_dir = Path(documents_path)
+            if not pdf_dir.exists():
+                if self.verbose:
+                    logger.error(f"❌ Document directory not found: {pdf_dir}")
+                return False
+            
+            pdf_files = list(pdf_dir.glob("*.pdf"))
+            if not pdf_files:
+                if self.verbose:
+                    logger.warning(f"⚠️ No PDF files found in: {pdf_dir}")
+                return False
+                
+            if self.verbose:
+                logger.info(f"🔧 Rebuilding document index from {len(pdf_files)} PDF files")
+                
+            # Clear existing index
+            self.processed_documents = {}
+            
+            # Process each PDF and add to index
+            for pdf_file in pdf_files:
+                doc_id = self._get_document_id(pdf_file)
+                
+                # Get page count from PDF (quick check without full processing)
+                try:
+                    import PyPDF2
+                    with open(pdf_file, 'rb') as file:
+                        pdf_reader = PyPDF2.PdfReader(file)
+                        page_count = len(pdf_reader.pages)
+                except:
+                    try:
+                        import fitz  # PyMuPDF
+                        with fitz.open(pdf_file) as pdf_doc:
+                            page_count = pdf_doc.page_count
+                    except:
+                        page_count = 1  # Default if can't read
+                
+                # Add to processed documents
+                self.processed_documents[doc_id] = {
+                    'file_path': str(pdf_file),
+                    'processed_at': datetime.now().isoformat(),
+                    'chunk_count': page_count,  # Approximate
+                    'embedding_provider': self.active_embedding_provider or 'bge'
+                }
+                
+                if self.verbose:
+                    logger.info(f"✅ Added to index: {pdf_file.name} ({page_count} chunks)")
+            
+            # Save the rebuilt index
+            self._save_document_index()
+            
+            if self.verbose:
+                logger.info(f"🎉 Successfully rebuilt document index with {len(self.processed_documents)} documents")
+            return True
+            
+        except Exception as e:
+            if self.verbose:
+                logger.error(f"❌ Failed to rebuild document index: {e}")
+            return False
+
+    def _save_document_index(self):
+        """Save document index to disk."""
+        try:
+            os.makedirs(os.path.dirname(self.document_index_file), exist_ok=True)
+            with open(self.document_index_file, 'w', encoding='utf-8') as f:
+                json.dump(self.processed_documents, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            if self.verbose:
+                logger.warning(f"⚠️ Could not save document index: {e}")
+    
+    def _get_document_id(self, file_path: Path) -> str:
+        """Generate unique document ID based on file path and modification time."""
+        stat = file_path.stat()
+        return f"{file_path.name}_{int(stat.st_mtime)}_{stat.st_size}"
+    
+    def _is_document_processed(self, file_path: Path) -> bool:
+        """Check if document has already been processed."""
+        doc_id = self._get_document_id(file_path)
+        return doc_id in self.processed_documents
+    
+    def _mark_document_processed(self, file_path: Path, chunk_count: int = 0):
+        """Mark document as processed in the index."""
+        doc_id = self._get_document_id(file_path)
+        self.processed_documents[doc_id] = {
+            'file_path': str(file_path),
+            'processed_at': datetime.now().isoformat(),
+            'chunk_count': chunk_count,
+            'embedding_provider': self.active_embedding_provider
+        }
+        self._save_document_index()
+
+    def _reset_document_index(self):
+        """Reset document index when vectorstore is cleared or corrupted."""
+        self.processed_documents = {}
+        self._save_document_index()
+        if self.verbose:
+            logger.info("🗑️ Document index reset - all documents will be re-processed")
+
+    def _initialize_chain(self):
+        """Initialize the QA chain."""
+        if self.vectorstore is not None:
+            # Configure MMR retriever as requested
+            retriever = self.vectorstore.as_retriever(
+                search_type="mmr",  # Maximum Marginal Relevance
+                search_kwargs={
+                    "k": 5,           # Number of documents to return
+                    "fetch_k": 20,    # Number of documents to fetch before MMR
+                    "lambda_mult": 0.7  # Diversity parameter (0=max diversity, 1=min diversity)
+                }
+            )
+            
+            # Create custom prompt template for Albanian legal questions
+            custom_prompt_template = """
+Ti jeni një asistent juridik ekspert për legjislacionin shqiptar. Juve ju janë dhënë disa dokumente ligjore dhe një pyetje e përdoruesit. 
+
+DOKUMENTE LIGJORE:
+{context}
+
+PYETJA E PËRDORUESIT: {question}
+
+UDHËZIME TË DOMOSDOSHME:
+1. GJITHMONË jepni një përgjigje të plotë në gjuhën shqipe
+2. GJITHMONË analizoni dhe sintetizoni të gjitha informacionet nga dokumentet e dhëna
+3. MOS thoni kurrë "nuk e di" ose "nuk kam informacion" - jepni gjithçka që gjetët në dokumente
+4. GJITHMONË citoni nenin/nenet specifike të ligjit dhe emrin e dokumentit
+5. ORGANIZONI përgjigjen në mënyrë të strukturuar:
+   - Përmbledhje e shkurtër e përgjigjes
+   - Detaje të plotë nga legjislacioni
+   - Referencat specifike të ligjit
+
+PËRGJIGJA (në gjuhën shqipe):"""
+
+            custom_prompt = PromptTemplate(
+                template=custom_prompt_template,
+                input_variables=["context", "question"]
+            )
+            
+            self.qa_chain = RetrievalQA.from_chain_type(
+                llm=self.llm,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": custom_prompt},
+                memory=self.memory,
+                return_source_documents=True,
+                verbose=self.verbose
+            )
+            
+            if self.verbose:
+                logger.info("✅ QA chain initialized with MMR retrieval")
+        else:
+            self.qa_chain = None
+            if self.verbose:
+                logger.info("📝 QA chain will be initialized when vectorstore is ready")
+    
+    def _check_dimension_compatibility(self) -> bool:
+        """Check if existing ChromaDB dimensions match current embedding provider"""
+        try:
+            if not os.path.exists(self.persist_directory):
+                if self.verbose:
+                    logger.info("📁 No existing ChromaDB found")
+                # Reset document index for fresh start
+                self.processed_documents = {}
+                self._save_document_index()
+                return True  # No existing DB, so compatible
+            
+            # Check if there's any collection data first
+            collection_dir = Path(self.persist_directory)
+            chroma_db_file = collection_dir / "chroma.sqlite3"
+            
+            if not chroma_db_file.exists():
+                if self.verbose:
+                    logger.info("📊 ChromaDB directory exists but no database file found")
+                # Reset document index for fresh start
+                self.processed_documents = {}
+                self._save_document_index()
+                return True
+            
+            # Try to load existing vectorstore with a simple compatibility check
+            temp_vectorstore = Chroma(
+                persist_directory=self.persist_directory,
+                embedding_function=self.embeddings
+            )
+            
+            # Try to get collection info to check dimensions
+            collection = temp_vectorstore._collection
+            if collection.count() == 0:
+                if self.verbose:
+                    logger.info("📊 ChromaDB exists but is empty")
+                return True
+            
+            # Get embedding dimension from current provider
+            test_embedding = self.embeddings.embed_query("test")
+            current_dim = len(test_embedding)
+            
+            # Try a test query to see if dimensions match
+            test_results = temp_vectorstore.similarity_search("test", k=1)
+            if self.verbose:
+                logger.info(f"✅ ChromaDB compatible with {current_dim}-dim {self.active_embedding_provider} embeddings")
+            return True
+                        
+        except Exception as e:
+            error_str = str(e)
+            if "dimension" in error_str.lower():
+                if self.verbose:
+                    logger.warning(f"⚠️ Dimension mismatch detected: {error_str}")
+                    logger.warning(f"⚠️ ChromaDB incompatible with {self.active_embedding_provider} embeddings")
+                return False
+            else:
+                if self.verbose:
+                    logger.warning(f"⚠️ Could not check ChromaDB compatibility: {e}")
+                return True
+    
+    def _clear_incompatible_vectorstore(self):
+        """Clear ChromaDB if it's incompatible with current embedding provider"""
+        try:
+            import shutil
+            import time
+            import gc
+            
+            # Close any existing vectorstore connections
+            if hasattr(self, 'vectorstore') and self.vectorstore is not None:
+                try:
+                    # Try to close the connection if possible
+                    if hasattr(self.vectorstore, '_client'):
+                        self.vectorstore._client = None
+                    if hasattr(self.vectorstore, '_collection'):
+                        self.vectorstore._collection = None
+                    self.vectorstore = None
+                except Exception as e:
+                    if self.verbose:
+                        logger.warning(f"⚠️ Could not properly close vectorstore: {e}")
+            
+            # Force garbage collection to release any remaining references
+            gc.collect()
+            time.sleep(0.5)  # Give time for cleanup
+            
+            if os.path.exists(self.persist_directory):
+                if self.verbose:
+                    logger.info(f"🗑️ Clearing incompatible ChromaDB directory: {self.persist_directory}")
+                
+                # Try multiple times with increasing delays
+                max_attempts = 3
+                for attempt in range(max_attempts):
+                    try:
+                        shutil.rmtree(self.persist_directory)
+                        break
+                    except PermissionError as e:
+                        if attempt < max_attempts - 1:
+                            if self.verbose:
+                                logger.warning(f"⚠️ Attempt {attempt + 1} failed, retrying in {(attempt + 1) * 2}s...")
+                            time.sleep((attempt + 1) * 2)
+                        else:
+                            # Last attempt failed, try alternative method
+                            if self.verbose:
+                                logger.warning("⚠️ Using alternative deletion method...")
+                            self._force_delete_directory(self.persist_directory)
+                
+                # DON'T reset document index since documents were already processed successfully
+                # The issue was vector dimension mismatch, not document processing
+                if self.verbose:
+                    logger.info("✅ ChromaDB cleared - keeping document index since documents were processed successfully")
+            return True
+            
+        except Exception as e:
+            if self.verbose:
+                logger.error(f"❌ Failed to clear ChromaDB: {e}")
+            return False
+    
+    def _force_delete_directory(self, directory_path: str):
+        """Force delete directory using system commands as fallback"""
+        try:
+            import subprocess
+            import platform
+            
+            if platform.system() == "Windows":
+                # Use Windows rmdir with force flag
+                subprocess.run(['rmdir', '/S', '/Q', directory_path], 
+                             shell=True, check=False, capture_output=True)
+            else:
+                # Use Unix rm command
+                subprocess.run(['rm', '-rf', directory_path], 
+                             check=False, capture_output=True)
+                             
+            if self.verbose:
+                logger.info(f"🔨 Force deleted directory: {directory_path}")
+                
+        except Exception as e:
+            if self.verbose:
+                logger.error(f"❌ Force deletion also failed: {e}")
+                logger.info("💡 Manual deletion may be required - please delete chroma_db directory manually")
+    
+    def get_system_status(self) -> Dict[str, Any]:
+        """Get current system status."""
+        # Count total documents if vectorstore exists
+        total_docs = 0
+        if hasattr(self, 'vectorstore') and self.vectorstore is not None:
+            try:
+                # Get document count from vectorstore
+                collection = self.vectorstore._collection
+                total_docs = collection.count()
+            except:
+                total_docs = 0
+        
+        self.total_documents = total_docs
+        self.documents_loaded = total_docs > 0
+        
+        # Get the current embedding model name based on active provider
+        current_embedding_model = "unknown"
+        if hasattr(self, 'active_embedding_provider'):
+            if self.active_embedding_provider == "google":
+                current_embedding_model = self.google_embedding_model
+            elif self.active_embedding_provider == "bge":
+                current_embedding_model = self.bge_embedding_model
+            elif self.active_embedding_provider == "sentence-transformers":
+                current_embedding_model = self.fallback_embedding_model
+        
+        return {
+            'documents_loaded': self.documents_loaded,
+            'total_documents': self.total_documents,
+            'vectorstore_initialized': self.vectorstore is not None,
+            'chain_ready': self.qa_chain is not None,
+            'embedding_provider': getattr(self, 'active_embedding_provider', 'unknown'),
+            'embedding_model': current_embedding_model,
+            'llm_model': self.llm_model
+        }
+    
+    def reset_memory(self):
+        """Reset conversation memory."""
+        self.memory.clear()
+        if self.verbose:
+            logger.info("🔄 Conversation memory reset")
+    
+    def load_documents_from_directory(self, directory_path: str) -> bool:
+        """
+        Load documents from a directory and build the vector database.
+        Handles API quota limits with batch processing.
+        
+        Args:
+            directory_path: Path to directory containing documents
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if self.verbose:
+                logger.info(f"📂 Loading documents from: {directory_path}")
+            
+            # Check if we can load existing vectorstore first
+            if self._try_load_existing_vectorstore():
+                # Check if there are new documents to add
+                new_documents = []
+                
+                # Load from PDF directory if it exists
+                pdf_dir = Path(directory_path) / "pdfs"
+                if pdf_dir.exists():
+                    new_documents.extend(self._load_pdf_documents(pdf_dir))
+                
+                # Load from processed JSON files if they exist
+                processed_dir = Path(directory_path) / "processed"
+                if processed_dir.exists():
+                    new_documents.extend(self._load_processed_documents(processed_dir))
+                
+                # If we have new documents, add them to existing vectorstore
+                if new_documents:
+                    if self.verbose:
+                        logger.info(f"📝 Adding {len(new_documents)} new documents to existing vectorstore...")
+                    
+                    # Split new documents into chunks
+                    new_chunks = self.text_splitter.split_documents(new_documents)
+                    
+                    if self.verbose:
+                        logger.info(f"📊 Created {len(new_chunks)} new document chunks")
+                    
+                    # Add to existing vectorstore
+                    return self._add_chunks_to_vectorstore(new_chunks)
+                else:
+                    if self.verbose:
+                        logger.info("✅ All documents already processed - no new documents to add")
+                    return True
+            
+            # No existing vectorstore - load all documents
+            documents = []
+            
+            # Load from PDF directory if it exists
+            pdf_dir = Path(directory_path) / "pdfs"
+            if pdf_dir.exists():
+                documents.extend(self._load_pdf_documents(pdf_dir))
+            
+            # Load from processed JSON files if they exist
+            processed_dir = Path(directory_path) / "processed"
+            if processed_dir.exists():
+                documents.extend(self._load_processed_documents(processed_dir))
+            
+            if not documents:
+                logger.warning(f"⚠️ No documents found in {directory_path}")
+                return False
+            
+            # Split documents into chunks
+            if self.verbose:
+                logger.info(f"📝 Splitting {len(documents)} documents into chunks...")
+            
+            text_chunks = self.text_splitter.split_documents(documents)
+            
+            if self.verbose:
+                logger.info(f"📊 Created {len(text_chunks)} document chunks")
+            
+            # Create vectorstore with quota handling
+            success = self._create_vectorstore_with_quota_handling(text_chunks)
+            
+            if success:
+                self.documents_loaded = True
+                self.total_documents = len(text_chunks)
+                if self.verbose:
+                    logger.info(f"✅ Successfully loaded {len(text_chunks)} document chunks")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ Error loading documents: {e}")
+            if self.verbose:
+                import traceback
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+    
+    def _try_load_existing_vectorstore(self) -> bool:
+        """Try to load existing ChromaDB vectorstore with dimension compatibility check."""
+        try:
+            if Path(self.persist_directory).exists():
+                if self.verbose:
+                    logger.info("🔍 Found existing ChromaDB, checking compatibility...")
+                
+                # Check if existing vectorstore is compatible with current embedding dimensions
+                if not self._check_dimension_compatibility():
+                    if self.verbose:
+                        logger.warning(f"⚠️ ChromaDB incompatible with {self.active_embedding_provider} embeddings")
+                        logger.info("🔄 Clearing incompatible vectorstore...")
+                    
+                    if not self._clear_incompatible_vectorstore():
+                        return False
+                    
+                    if self.verbose:
+                        logger.info("✅ Ready to create fresh vectorstore with correct dimensions")
+                    return False  # Need to create new vectorstore
+                
+                # Compatible - load existing vectorstore
+                if self.verbose:
+                    logger.info(f"✅ ChromaDB compatible with {self.active_embedding_provider} embeddings")
+                
+                self.vectorstore = Chroma(
+                    persist_directory=self.persist_directory,
+                    embedding_function=self.embeddings
+                )
+                
+                # Check if it has data
+                if hasattr(self.vectorstore._collection, 'count'):
+                    count = self.vectorstore._collection.count()
+                    if count > 0:
+                        if self.verbose:
+                            logger.info(f"✅ Loaded existing vectorstore with {count} documents")
+                        
+                        self._initialize_chain()
+                        self.documents_loaded = True
+                        self.total_documents = count
+                        return True
+                
+        except Exception as e:
+            if self.verbose:
+                logger.warning(f"⚠️ Could not load existing vectorstore: {e}")
+        else:
+            # No existing ChromaDB directory found - reset document index
+            if self.verbose:
+                logger.info("📁 No existing ChromaDB found - starting fresh")
+            self._reset_document_index()
         
         return False
     
-    def _save_embeddings_cache(self):
-        """Save embeddings to cache file."""
-        if self.document_embeddings is None:
-            return
+    def _create_vectorstore_with_quota_handling(self, text_chunks: List[Document]) -> bool:
+        """Create vectorstore with API quota limit handling and automatic fallback."""
         
-        cache_file = self.google_cache_file if self.use_google_embeddings else "document_embeddings_cache.json"
+        # Try current embedding provider first
+        success = self._try_create_vectorstore(text_chunks)
         
-        try:
-            # Convert numpy array to list for JSON serialization
-            import numpy as np
-            if isinstance(self.document_embeddings, np.ndarray):
-                embeddings_list = self.document_embeddings.tolist()
-            else:
-                embeddings_list = self.document_embeddings
+        if not success and self.active_embedding_provider == "google":
+            if self.verbose:
+                logger.warning("⚠️ Google embeddings failed (likely quota exceeded)")
+                logger.info("🔄 Falling back to BGE embeddings (Priority 2)...")
+            
+            # Clear any existing ChromaDB that might have incompatible dimensions
+            self._clear_incompatible_vectorstore()
+            
+            # Try to switch to BGE embeddings
+            if self._switch_to_fallback_embeddings("bge"):
+                success = self._try_create_vectorstore(text_chunks)
+            
+            # If BGE also fails, try sentence-transformers
+            if not success:
+                if self.verbose:
+                    logger.warning("⚠️ BGE embeddings also failed")
+                    logger.info("🔄 Falling back to SentenceTransformers (Priority 3)...")
                 
-            cache = {
-                'embeddings': embeddings_list,
-                'timestamp': time.time(),
-                'document_count': len(self.legal_documents)
-            }
-            
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                json.dump(cache, f)
-            
-            print(f"💾 Saved embeddings cache: {cache_file}")
-            
+                # Clear ChromaDB again for sentence transformers
+                self._clear_incompatible_vectorstore()
+                
+                if self._switch_to_fallback_embeddings("sentence-transformers"):
+                    success = self._try_create_vectorstore(text_chunks)
+        
+        return success
+    
+    def _switch_to_fallback_embeddings(self, provider: str) -> bool:
+        """Switch to a fallback embedding provider."""
+        try:
+            if provider == "bge" and HUGGINGFACE_AVAILABLE:
+                base_embeddings = HuggingFaceEmbeddings(
+                    model_name=self.bge_embedding_model,
+                    model_kwargs={'device': self.device}
+                )
+                # Wrap with dimension normalizer
+                self.embeddings = DimensionNormalizedEmbeddings(base_embeddings, target_dimension=384)
+                self.active_embedding_provider = "bge"
+                if self.verbose:
+                    logger.info(f"✅ Switched to BGE embeddings: {self.bge_embedding_model} (384 dims)")
+                return True
+                
+            elif provider == "sentence-transformers":
+                from langchain_community.embeddings import SentenceTransformerEmbeddings
+                base_embeddings = SentenceTransformerEmbeddings(
+                    model_name=self.fallback_embedding_model
+                )
+                # Wrap with dimension normalizer  
+                self.embeddings = DimensionNormalizedEmbeddings(base_embeddings, target_dimension=384)
+                self.active_embedding_provider = "sentence-transformers"
+                if self.verbose:
+                    logger.info(f"✅ Switched to SentenceTransformers: {self.fallback_embedding_model} (384 dims)")
+                return True
+                
         except Exception as e:
-            print(f"Warning: Could not save embeddings cache: {e}")
+            if self.verbose:
+                logger.error(f"❌ Failed to switch to {provider}: {e}")
+        
+        return False
     
-    # ================================
-    # SEARCH METHODS
-    # ================================
-    
-    def _search_traditional(self, query: str, top_k: int, mode: str, session_id: Optional[str], multi_query: bool) -> List[Dict]:
-        """Traditional similarity-based search."""
+    def _try_create_vectorstore(self, text_chunks: List[Document]) -> bool:
+        """Try to create vectorstore with current embedding provider."""
         try:
-            from sklearn.metrics.pairwise import cosine_similarity
-            
-            # Enhanced query with Albanian legal context
-            enhanced_query = self._enhance_albanian_query(query)
-            
-            # Get query embedding - ensure it matches the document embedding space
-            query_embedding = None
-            
-            # Check if we have Google embeddings available and working
-            if self.use_google_embeddings and self.google_api:
-                query_embedding = self._get_google_query_embedding(enhanced_query)
-                
-            # If Google failed or not available, use local model
-            if query_embedding is None:
-                if not self.model:
-                    print("❌ Local model not loaded for query embedding")
-                    return []
-                query_embedding = self.model.encode([enhanced_query])
-                print(f"🔍 Using local model for query: '{query}'")
-            
-            # Ensure query_embedding is 2D for cosine_similarity
-            import numpy as np
-            if isinstance(query_embedding, list):
-                query_embedding = np.array(query_embedding)
-            if query_embedding.ndim == 1:
-                query_embedding = query_embedding.reshape(1, -1)
-            
-            # Check dimension compatibility
-            query_dim = query_embedding.shape[1]
-            doc_dim = self.document_embeddings.shape[1]
-            
-            if query_dim != doc_dim:
-                print(f"⚠️ Dimension mismatch: Query={query_dim}, Documents={doc_dim}")
-                print("🔄 Switching to local model for consistency...")
-                
-                # Force local model for query to match document embeddings
-                if not self.model:
-                    print("❌ Local model not available for dimension matching")
-                    return []
-                
-                query_embedding = self.model.encode([enhanced_query]).reshape(1, -1)
-                print(f"✅ Using local model query embedding: {query_embedding.shape}")
-            
-            # Calculate dense similarities
-            dense_sim = cosine_similarity(query_embedding, self.document_embeddings)[0]
-
-            # Calculate sparse similarities if enabled
-            sparse_sim = None
-            if self.tfidf_vectorizer is not None and self.tfidf_matrix is not None and mode in ('hybrid', 'sparse'):
-                try:
-                    q_vec = self.tfidf_vectorizer.transform([enhanced_query])
-                    sparse_sim = (q_vec @ self.tfidf_matrix.T).toarray()[0]
-                except Exception:
-                    sparse_sim = None
-
-            # Combine similarities
-            if mode == 'embedding' or sparse_sim is None:
-                combined_sim = dense_sim
-            elif mode == 'sparse':
-                combined_sim = sparse_sim
+            # For Google embeddings, use small batches to avoid quota limits
+            if self.active_embedding_provider == "google":
+                batch_size = 10  # Small batch size for Google API
+                delay_between_batches = 10  # 10 seconds delay
             else:
-                alpha = self.hybrid_alpha
-                combined_sim = alpha * dense_sim + (1 - alpha) * sparse_sim
+                # For local models, we can use larger batches
+                batch_size = 50
+                delay_between_batches = 1
             
-            # Multi-query expansion if enabled
-            if multi_query:
-                rewrites = self._expand_queries(enhanced_query)
-                for rw in rewrites:
-                    if rw.strip() == enhanced_query.strip():
-                        continue
+            if len(text_chunks) > batch_size:
+                if self.verbose:
+                    logger.info(f"📊 Processing {len(text_chunks)} chunks in batches of {batch_size}")
+                    if self.active_embedding_provider == "google":
+                        logger.info(f"⏱️ Using delays due to Google API rate limits...")
+                
+                # Process first batch to create vectorstore
+                first_batch = text_chunks[:batch_size]
+                if self.verbose:
+                    logger.info(f"📝 Processing batch 1/{(len(text_chunks) + batch_size - 1) // batch_size}")
+                
+                self.vectorstore = Chroma.from_documents(
+                    documents=first_batch,
+                    embedding=self.embeddings,
+                    persist_directory=self.persist_directory
+                )
+                
+                # Process remaining batches
+                remaining_chunks = text_chunks[batch_size:]
+                
+                for i in range(0, len(remaining_chunks), batch_size):
+                    batch_num = (i // batch_size) + 2
+                    total_batches = (len(text_chunks) + batch_size - 1) // batch_size
                     
-                    # Get rewrite embedding
-                    if self.use_google_embeddings:
-                        rw_emb = self._get_google_query_embedding(rw)
-                        if rw_emb is None and self.model:
-                            rw_emb = self.model.encode([rw])
-                    else:
-                        rw_emb = self.model.encode([rw]) if self.model else None
+                    if self.verbose:
+                        logger.info(f"⏳ Waiting {delay_between_batches}s before next batch...")
                     
-                    if rw_emb is not None:
-                        # Ensure rw_emb is 2D for cosine_similarity
-                        if isinstance(rw_emb, list):
-                            rw_emb = np.array(rw_emb)
-                        if rw_emb.ndim == 1:
-                            rw_emb = rw_emb.reshape(1, -1)
-                        
-                        # Check dimension compatibility for rewrite embeddings
-                        if rw_emb.shape[1] != self.document_embeddings.shape[1]:
-                            print(f"⚠️ Rewrite dimension mismatch, using local model...")
-                            if self.model:
-                                rw_emb = self.model.encode([rw]).reshape(1, -1)
-                            else:
-                                continue
-                            
-                        rw_dense_sim = cosine_similarity(rw_emb, self.document_embeddings)[0]
-                        
-                        # Combine with sparse if available
-                        if sparse_sim is not None and mode in ('hybrid', 'sparse'):
-                            try:
-                                rw_q_vec = self.tfidf_vectorizer.transform([rw])
-                                rw_sparse_sim = (rw_q_vec @ self.tfidf_matrix.T).toarray()[0]
-                                rw_combined = alpha * rw_dense_sim + (1 - alpha) * rw_sparse_sim
-                            except Exception:
-                                rw_combined = rw_dense_sim
+                    time.sleep(delay_between_batches)
+                    
+                    batch = remaining_chunks[i:i + batch_size]
+                    if self.verbose:
+                        logger.info(f"📝 Processing batch {batch_num}/{total_batches} ({len(batch)} documents)")
+                    
+                    try:
+                        self.vectorstore.add_documents(batch)
+                    except Exception as e:
+                        if "429" in str(e) or "quota" in str(e).lower():
+                            if self.verbose:
+                                logger.warning(f"⚠️ Hit rate limit, increasing delay to {delay_between_batches * 2}s")
+                            delay_between_batches *= 2
+                            time.sleep(delay_between_batches)
+                            self.vectorstore.add_documents(batch)
                         else:
-                            rw_combined = rw_dense_sim
+                            raise e
+            else:
+                # Small number of chunks, process all at once
+                self.vectorstore = Chroma.from_documents(
+                    documents=text_chunks,
+                    embedding=self.embeddings,
+                    persist_directory=self.persist_directory
+                )
+            
+            # Initialize chain now that we have documents
+            self._initialize_chain()
+            
+            return True
+            
+        except Exception as e:
+            if self.verbose:
+                logger.error(f"❌ Error creating vectorstore with {self.active_embedding_provider}: {e}")
+            return False
+    
+    def _add_chunks_to_vectorstore(self, text_chunks: List[Document]) -> bool:
+        """Add new document chunks to existing vectorstore."""
+        if not self.vectorstore:
+            if self.verbose:
+                logger.error("❌ No existing vectorstore to add documents to")
+            return False
+        
+        try:
+            # Use similar batch processing as create method
+            batch_size = 50 if self.active_embedding_provider == "bge" else 10
+            delay_between_batches = 1 if self.active_embedding_provider != "google" else 3
+            
+            if len(text_chunks) > batch_size:
+                if self.verbose:
+                    logger.info(f"📊 Adding {len(text_chunks)} chunks in batches of {batch_size}")
+                
+                # Process in batches
+                for i in range(0, len(text_chunks), batch_size):
+                    batch_num = (i // batch_size) + 1
+                    total_batches = (len(text_chunks) + batch_size - 1) // batch_size
+                    
+                    batch = text_chunks[i:i + batch_size]
+                    if self.verbose:
+                        logger.info(f"📝 Adding batch {batch_num}/{total_batches} ({len(batch)} documents)")
+                    
+                    try:
+                        self.vectorstore.add_documents(batch)
                         
-                        # Take max of original and rewrite similarities
-                        combined_sim = np.maximum(combined_sim, rw_combined)
-            
-            # MMR selection for diversity (if implemented)
-            if hasattr(self, 'mmr_lambda') and hasattr(self, '_mmr_select'):
-                selected_indices = self._mmr_select(query_embedding[0], self.document_embeddings, combined_sim, k=top_k, lambda_param=self.mmr_lambda)
+                        if i + batch_size < len(text_chunks):  # Not the last batch
+                            if self.verbose:
+                                logger.info(f"⏳ Waiting {delay_between_batches}s before next batch...")
+                            time.sleep(delay_between_batches)
+                            
+                    except Exception as e:
+                        if "429" in str(e) or "quota" in str(e).lower():
+                            if self.verbose:
+                                logger.warning(f"⚠️ Hit rate limit, increasing delay to {delay_between_batches * 2}s")
+                            delay_between_batches *= 2
+                            time.sleep(delay_between_batches)
+                            self.vectorstore.add_documents(batch)
+                        else:
+                            raise e
             else:
-                # Simple top-k selection
-                selected_indices = np.argsort(combined_sim)[-top_k:][::-1]
+                # Small number of chunks, add all at once
+                self.vectorstore.add_documents(text_chunks)
             
-            # Expand with neighbors if enabled
-            if hasattr(self, 'neighbor_expansion') and hasattr(self, '_expand_neighbors'):
-                expanded_indices = self._expand_neighbors(selected_indices, self.neighbor_expansion)
-            else:
-                expanded_indices = selected_indices
+            # Update document count
+            if hasattr(self.vectorstore._collection, 'count'):
+                self.total_documents = self.vectorstore._collection.count()
             
-            results = []
-            max_similarity = 0
+            if self.verbose:
+                logger.info(f"✅ Successfully added {len(text_chunks)} new chunks to vectorstore")
             
-            # Find the maximum similarity for adaptive thresholding
-            for idx in expanded_indices:
-                similarity = float(combined_sim[idx])
-                if similarity > max_similarity:
-                    max_similarity = similarity
-                    
-            # Use adaptive thresholding like the original
-            base_threshold = getattr(self, 'similarity_threshold', 0.15)
-            if self.use_google_embeddings:
-                # Google embeddings have different scale
-                base_threshold = max(0.1, base_threshold * 0.8)
-                
-            adaptive_threshold = max(base_threshold, max_similarity * 0.7) if max_similarity > 0.2 else base_threshold
-            
-            # Build results with original logic
-            for i, idx in enumerate(expanded_indices):
-                similarity = float(combined_sim[idx])
-                
-                # Always include first result if it meets minimum threshold, or use adaptive threshold
-                if similarity > adaptive_threshold or (len(results) == 0 and i == 0 and similarity > 0.1):
-                    doc = self.legal_documents[idx].copy()
-                    doc['similarity_score'] = similarity
-                    doc['similarity'] = similarity  # For compatibility
-                    doc['rank'] = len(results) + 1
-                    doc['score'] = similarity  # Also add 'score' for compatibility
-                    doc['text'] = doc.get('content', '')  # Add 'text' field for compatibility
-                    results.append(doc)
-            
-            print(f"🔍 Search for '{query}': max_sim={max_similarity:.4f}, threshold={adaptive_threshold:.4f}, found {len(results)} results")
-            return results
+            return True
             
         except Exception as e:
-            print(f"Error in traditional search: {e}")
-            return []
-    
-    def _expand_queries(self, query: str) -> List[str]:
-        """Expand query with Albanian legal synonyms."""
-        expansions = [query]
-        
-        # Albanian legal term expansions
-        legal_expansions = {
-            'martesë': ['martesa', 'kurorëzim', 'lidhja martesore'],
-            'pronësi': ['pronësia', 'të drejta pronësie', 'zotërim'],
-            'punësim': ['punë', 'marrëdhënie pune', 'kontratë pune'],
-            'gjykatë': ['gjykata', 'gjykim', 'proces gjyqësor'],
-            'ligj': ['ligjin', 'legjislacion', 'normë ligjore'],
-            'vrasje': ['vrasja', 'vdekje me dashje', 'homicid'],
-            'dënim': ['dënimin', 'sanksion', 'ndëshkim'],
-            'kontratë': ['kontrata', 'marrëveshje', 'akt juridik']
-        }
-        
-        query_lower = query.lower()
-        for term, synonyms in legal_expansions.items():
-            if term in query_lower:
-                for synonym in synonyms:
-                    expanded = query_lower.replace(term, synonym)
-                    if expanded != query_lower:
-                        expansions.append(expanded)
-                break  # Only expand first match to avoid too many variations
-        
-        return expansions[:3]  # Limit to avoid too many queries
-    
-    def _search_hierarchical(self, query: str, top_k: int, session_id: Optional[str], multi_query: bool) -> List[Dict]:
-        """Hierarchical search implementation (first summary, then detailed)."""
-        if not self.document_summaries or not hasattr(self, 'document_summary_embeddings'):
-            print("Warning: Hierarchical structures not available, falling back to traditional search")
-            return self._search_traditional(query, top_k, 'hybrid', session_id, multi_query)
+            if self.verbose:
+                logger.error(f"❌ Error adding chunks to vectorstore: {e}")
+            return False
+
+    def _load_pdf_documents(self, pdf_dir: Path) -> List[Document]:
+        """Load documents from PDF directory with incremental processing."""
+        documents = []
+        new_documents = []
         
         try:
-            from sklearn.metrics.pairwise import cosine_similarity
-            
-            # Step 1: Search document summaries first
-            enhanced_query = f"Pyetje ligjore shqiptare: {query}"
-            
-            if self.use_google_embeddings:
-                query_embedding = self._get_google_query_embedding(enhanced_query)
+            # Import PDF processing libraries
+            try:
+                import PyPDF2
+                PDF_READER_AVAILABLE = True
+            except ImportError:
+                try:
+                    import fitz  # PyMuPDF
+                    PDF_READER_AVAILABLE = True
+                    PDF_READER_TYPE = "pymupdf"
+                except ImportError:
+                    if self.verbose:
+                        logger.warning("⚠️ No PDF reader available (PyPDF2 or PyMuPDF). Install with: pip install PyPDF2 or pip install PyMuPDF")
+                    return documents
+                else:
+                    PDF_READER_TYPE = "pymupdf"
             else:
-                query_embedding = self.model.encode([enhanced_query]) if self.model else None
+                PDF_READER_TYPE = "pypdf2"
             
-            if query_embedding is None:
-                return self._search_traditional(query, top_k, 'hybrid', session_id, multi_query)
+            if not PDF_READER_AVAILABLE:
+                return documents
             
-            # Ensure query_embedding is 2D for cosine_similarity
-            import numpy as np
-            if isinstance(query_embedding, list):
-                query_embedding = np.array(query_embedding)
-            if query_embedding.ndim == 1:
-                query_embedding = query_embedding.reshape(1, -1)
+            # Get all PDF files
+            pdf_files = list(pdf_dir.glob("*.pdf"))
             
-            # Find most relevant document summaries
-            summary_similarities = cosine_similarity(query_embedding, self.document_summary_embeddings)[0]
-            top_summary_indices = np.argsort(summary_similarities)[-min(top_k*2, len(self.document_summaries)):][::-1]
+            if not pdf_files:
+                if self.verbose:
+                    logger.info(f"📄 No PDF files found in: {pdf_dir}")
+                return documents
             
-            # Step 2: Search within selected documents' chunks
-            relevant_chunks = []
-            for summary_idx in top_summary_indices:
-                if summary_similarities[summary_idx] > 0.1:  # Threshold for relevance
-                    doc_summary = self.document_summaries[summary_idx]
-                    chunk_indices = doc_summary.get('chunk_indices', [])
-                    
-                    # Search within this document's chunks
-                    for chunk_idx in chunk_indices:
-                        if chunk_idx < len(self.legal_documents):
-                            relevant_chunks.append((chunk_idx, summary_similarities[summary_idx]))
+            if self.verbose:
+                logger.info(f"📄 Found {len(pdf_files)} PDF files to check")
             
-            # Step 3: Re-rank selected chunks
-            if relevant_chunks:
-                chunk_indices = [chunk[0] for chunk in relevant_chunks]
-                chunk_embeddings = self.document_embeddings[chunk_indices]
-                chunk_similarities = cosine_similarity(query_embedding, chunk_embeddings)[0]
-                
-                # Combine summary and chunk scores
-                combined_scores = []
-                for i, (chunk_idx, summary_score) in enumerate(relevant_chunks):
-                    combined_score = 0.7 * chunk_similarities[i] + 0.3 * summary_score
-                    combined_scores.append((chunk_idx, combined_score))
-                
-                # Sort by combined score and return top results
-                combined_scores.sort(key=lambda x: x[1], reverse=True)
-                
-                results = []
-                for i, (chunk_idx, score) in enumerate(combined_scores[:top_k]):
-                    if score > 0.1:
-                        doc = self.legal_documents[chunk_idx].copy()
-                        doc['similarity_score'] = float(score)
-                        doc['rank'] = i + 1
-                        doc['search_method'] = 'hierarchical'
-                        results.append(doc)
-                
-                return results
-            
-            # Fallback to traditional search
-            return self._search_traditional(query, top_k, 'hybrid', session_id, multi_query)
-            
-        except Exception as e:
-            print(f"Error in hierarchical search: {e}")
-            return self._search_traditional(query, top_k, 'hybrid', session_id, multi_query)
-    
-    def _search_sentence_window(self, query: str, top_k: int, session_id: Optional[str], multi_query: bool) -> List[Dict]:
-        """Sentence window search implementation."""
-        if not hasattr(self, 'sentence_windows') or not self.sentence_windows:
-            print("Warning: Sentence window structures not available, falling back to traditional search")
-            return self._search_traditional(query, top_k, 'hybrid', session_id, multi_query)
-        
-        try:
-            from sklearn.metrics.pairwise import cosine_similarity
-            
-            # Search sentence windows
-            enhanced_query = f"Pyetje ligjore shqiptare: {query}"
-            
-            if self.use_google_embeddings:
-                query_embedding = self._get_google_query_embedding(enhanced_query)
-            else:
-                query_embedding = self.model.encode([enhanced_query]) if self.model else None
-            
-            if query_embedding is None:
-                return self._search_traditional(query, top_k, 'hybrid', session_id, multi_query)
-            
-            # Ensure query_embedding is 2D for cosine_similarity
-            import numpy as np
-            if isinstance(query_embedding, list):
-                query_embedding = np.array(query_embedding)
-            if query_embedding.ndim == 1:
-                query_embedding = query_embedding.reshape(1, -1)
-            
-            # Calculate similarities with sentence windows
-            window_embeddings = np.array([window['embedding'] for window in self.sentence_windows])
-            similarities = cosine_similarity(query_embedding, window_embeddings)[0]
-            
-            # Get top sentence windows
-            top_indices = np.argsort(similarities)[-top_k*3:][::-1]  # Get more windows initially
-            
-            # Expand to full context and deduplicate by parent document
-            seen_docs = set()
-            results = []
-            
-            for idx in top_indices:
-                if len(results) >= top_k:
-                    break
-                    
-                window = self.sentence_windows[idx]
-                parent_doc_id = window.get('parent_doc_id')
-                
-                if parent_doc_id not in seen_docs and similarities[idx] > 0.1:
-                    seen_docs.add(parent_doc_id)
-                    
-                    # Create result with expanded context
-                    result = {
-                        'id': window.get('parent_doc_id', f'sentence_window_{idx}'),
-                        'title': window.get('parent_title', 'Unknown Document'),
-                        'content': window.get('expanded_content', window.get('sentence', '')),
-                        'source': window.get('source', 'Unknown'),
-                        'similarity_score': float(similarities[idx]),
-                        'rank': len(results) + 1,
-                        'search_method': 'sentence_window',
-                        'matched_sentence': window.get('sentence', ''),
-                        'document_type': window.get('document_type', 'unknown')
-                    }
-                    results.append(result)
-            
-            return results
-            
-        except Exception as e:
-            print(f"Error in sentence window search: {e}")
-            return self._search_traditional(query, top_k, 'hybrid', session_id, multi_query)
-    
-    def _build_hierarchical_structures(self):
-        """Build hierarchical search structures (document summaries)."""
-        if not self.legal_documents:
-            return
-        
-        try:
-            print("🔄 Building hierarchical search structures...")
-            
-            # Group chunks by document/source
-            doc_groups = {}
-            for i, doc in enumerate(self.legal_documents):
-                # Create a key to group related chunks
-                source = doc.get('source', 'unknown')
-                title = doc.get('title', 'unknown')
-                doc_key = f"{source}_{title}"
-                
-                if doc_key not in doc_groups:
-                    doc_groups[doc_key] = {
-                        'title': title,
-                        'source': source,
-                        'filename': doc.get('filename', ''),
-                        'document_type': doc.get('document_type', ''),
-                        'chunks': [],
-                        'chunk_indices': []
-                    }
-                
-                doc_groups[doc_key]['chunks'].append(doc.get('content', ''))
-                doc_groups[doc_key]['chunk_indices'].append(i)
-            
-            # Create summaries for each document
-            self.document_summaries = []
-            for doc_key, doc_data in doc_groups.items():
-                # Create summary by taking first part of each chunk
-                summary_parts = []
-                total_chars = 0
-                for chunk in doc_data['chunks']:
-                    if total_chars >= 3000:  # Limit summary length
-                        break
-                    chunk_part = chunk[:1000]  # First 1000 chars of chunk
-                    summary_parts.append(chunk_part)
-                    total_chars += len(chunk_part)
-                
-                summary = ' '.join(summary_parts)
-                enhanced_summary = f"Dokument ligjor: {doc_data['title']}. Përmban: {summary}"
-                
-                self.document_summaries.append({
-                    'id': doc_key,
-                    'title': doc_data['title'],
-                    'source': doc_data['source'],
-                    'filename': doc_data['filename'],
-                    'document_type': doc_data['document_type'],
-                    'summary': enhanced_summary,
-                    'chunk_indices': doc_data['chunk_indices']
-                })
-            
-            # Generate embeddings for summaries
-            self._generate_summary_embeddings()
-            
-            print(f"✅ Built hierarchical structures: {len(self.document_summaries)} document summaries")
-            
-        except Exception as e:
-            print(f"Error building hierarchical structures: {e}")
-            self.document_summaries = []
-    
-    def _generate_summary_embeddings(self):
-        """Generate embeddings for document summaries."""
-        if not self.document_summaries:
-            return
-        
-        try:
-            summary_texts = [doc['summary'] for doc in self.document_summaries]
-            
-            if self.use_google_embeddings:
-                self.document_summary_embeddings = self._get_google_embeddings(summary_texts)
-            elif self.model:
-                self.document_summary_embeddings = self.model.encode(summary_texts)
-            
-            if hasattr(self, 'document_summary_embeddings') and self.document_summary_embeddings is not None:
-                print(f"✅ Generated embeddings for {len(summary_texts)} document summaries")
-            else:
-                print("❌ Failed to generate summary embeddings")
-                
-        except Exception as e:
-            print(f"Error generating summary embeddings: {e}")
-            self.document_summary_embeddings = None
-    
-    def _build_sentence_structures(self):
-        """Build sentence-level search structures."""
-        if not self.legal_documents:
-            return
-        
-        try:
-            print("🔄 Building sentence window structures...")
-            
-            self.sentence_windows = []
-            
-            for doc_idx, doc in enumerate(self.legal_documents):
-                content = doc.get('content', '')
-                if len(content.strip()) < 50:  # Skip very short content
+            # Process each PDF
+            for pdf_file in pdf_files:
+                # Check if this PDF has already been processed
+                if self._is_document_processed(pdf_file):
+                    if self.verbose:
+                        logger.info(f"⏩ Skipping already processed PDF: {pdf_file.name}")
                     continue
                 
-                # Split into sentences (simple approach for Albanian)
-                sentences = self._split_into_sentences(content)
+                if self.verbose:
+                    logger.info(f"📖 Processing new PDF: {pdf_file.name}")
                 
-                for sent_idx, sentence in enumerate(sentences):
-                    if len(sentence.strip()) < 20:  # Skip very short sentences
-                        continue
+                # Extract text from PDF
+                pdf_documents = self._extract_text_from_pdf(pdf_file, PDF_READER_TYPE)
+                
+                if pdf_documents:
+                    # Mark this PDF as processed
+                    self._mark_document_processed(pdf_file, len(pdf_documents))
+                    documents.extend(pdf_documents)
+                    new_documents.extend(pdf_documents)
                     
-                    # Create expanded context (sentence + surrounding sentences)
-                    start_idx = max(0, sent_idx - 2)
-                    end_idx = min(len(sentences), sent_idx + 3)
-                    expanded_context = ' '.join(sentences[start_idx:end_idx])
-                    
-                    # Generate embedding for the sentence
-                    if self.use_google_embeddings:
-                        sentence_embedding = self._get_google_query_embedding(sentence)
-                    elif self.model:
-                        sentence_embedding = self.model.encode([sentence])[0]
-                    else:
-                        continue
-                    
-                    if sentence_embedding is not None:
-                        window = {
-                            'sentence': sentence,
-                            'expanded_content': expanded_context,
-                            'embedding': sentence_embedding,
-                            'parent_doc_id': doc.get('id', f'doc_{doc_idx}'),
-                            'parent_title': doc.get('title', 'Unknown'),
-                            'source': doc.get('source', 'Unknown'),
-                            'document_type': doc.get('document_type', 'unknown'),
-                            'sentence_index': sent_idx,
-                            'doc_index': doc_idx
-                        }
-                        self.sentence_windows.append(window)
+                    if self.verbose:
+                        logger.info(f"✅ Extracted {len(pdf_documents)} pages from {pdf_file.name}")
+                else:
+                    if self.verbose:
+                        logger.warning(f"⚠️ Could not extract text from {pdf_file.name}")
             
-            print(f"✅ Built sentence window structures: {len(self.sentence_windows)} sentence windows")
+            if new_documents and self.verbose:
+                logger.info(f"📝 Found {len(new_documents)} new PDF pages to process")
+            elif self.verbose:
+                logger.info("✅ All PDF files already processed - using existing data")
+                
+        except Exception as e:
+            logger.error(f"❌ Error loading PDF documents: {e}")
+            if self.verbose:
+                import traceback
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+        
+        return documents
+    
+    def _extract_text_from_pdf(self, pdf_file: Path, reader_type: str) -> List[Document]:
+        """Extract text from a PDF file."""
+        documents = []
+        
+        try:
+            if reader_type == "pypdf2":
+                import PyPDF2
+                
+                with open(pdf_file, 'rb') as file:
+                    pdf_reader = PyPDF2.PdfReader(file)
+                    
+                    for page_num, page in enumerate(pdf_reader.pages):
+                        try:
+                            text = page.extract_text()
+                            if text.strip():  # Only add non-empty pages
+                                doc = Document(
+                                    page_content=text,
+                                    metadata={
+                                        'title': pdf_file.stem,
+                                        'source': str(pdf_file),
+                                        'document_type': 'pdf',
+                                        'page_number': page_num + 1,
+                                        'filename': pdf_file.name,
+                                        'file_path': str(pdf_file)
+                                    }
+                                )
+                                documents.append(doc)
+                        except Exception as e:
+                            if self.verbose:
+                                logger.warning(f"⚠️ Could not extract text from page {page_num + 1} of {pdf_file.name}: {e}")
+                            
+            elif reader_type == "pymupdf":
+                import fitz
+                
+                pdf_document = fitz.open(str(pdf_file))
+                
+                for page_num in range(len(pdf_document)):
+                    try:
+                        page = pdf_document.load_page(page_num)
+                        text = page.get_text()
+                        
+                        if text.strip():  # Only add non-empty pages
+                            doc = Document(
+                                page_content=text,
+                                metadata={
+                                    'title': pdf_file.stem,
+                                    'source': str(pdf_file),
+                                    'document_type': 'pdf',
+                                    'page_number': page_num + 1,
+                                    'filename': pdf_file.name,
+                                    'file_path': str(pdf_file)
+                                }
+                            )
+                            documents.append(doc)
+                    except Exception as e:
+                        if self.verbose:
+                            logger.warning(f"⚠️ Could not extract text from page {page_num + 1} of {pdf_file.name}: {e}")
+                
+                pdf_document.close()
+                
+        except Exception as e:
+            logger.error(f"❌ Error extracting text from {pdf_file.name}: {e}")
+        
+        return documents
+    
+    def _load_processed_documents(self, processed_dir: Path) -> List[Document]:
+        """Load documents from processed JSON files with incremental loading support."""
+        documents = []
+        new_documents = []
+        
+        try:
+            for json_file in processed_dir.glob("*.json"):
+                # Check if this document has already been processed
+                if self._is_document_processed(json_file):
+                    if self.verbose:
+                        logger.info(f"⏩ Skipping already processed: {json_file.name}")
+                    continue
+                
+                if self.verbose and len(documents) % 100 == 0:
+                    logger.info(f"📄 Processing new document: {json_file.name}")
+                
+                file_documents = []
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Handle different JSON structures
+                if isinstance(data, list):
+                    # Handle list of documents
+                    for item in data:
+                        if isinstance(item, dict) and 'content' in item:
+                            doc = Document(
+                                page_content=item['content'],
+                                metadata={
+                                    'title': item.get('title', ''),
+                                    'source': item.get('source', str(json_file)),
+                                    'document_type': item.get('document_type', 'processed')
+                                }
+                            )
+                            file_documents.append(doc)
+                elif isinstance(data, dict):
+                    # Handle single document with chunks structure
+                    if 'chunks' in data:
+                        title = data.get('title', '')
+                        source = data.get('source_url', str(json_file))
+                        doc_type = data.get('document_type', 'processed')
+                        
+                        for chunk in data['chunks']:
+                            if isinstance(chunk, dict) and 'content' in chunk:
+                                doc = Document(
+                                    page_content=chunk['content'],
+                                    metadata={
+                                        'title': title,
+                                        'source': source,
+                                        'document_type': doc_type,
+                                        'chunk': chunk.get('metadata', {}).get('chunk', 1),
+                                        'filename': data.get('filename', '')
+                                    }
+                                )
+                                file_documents.append(doc)
+                    elif 'content' in data:
+                        # Handle single document with direct content
+                        doc = Document(
+                            page_content=data['content'],
+                            metadata={
+                                'title': data.get('title', ''),
+                                'source': data.get('source', str(json_file)),
+                                'document_type': data.get('document_type', 'processed')
+                            }
+                        )
+                        file_documents.append(doc)
+                
+                # Mark document as processed and add to collections
+                if file_documents:
+                    self._mark_document_processed(json_file, len(file_documents))
+                    documents.extend(file_documents)
+                    new_documents.extend(file_documents)
+                
+        except Exception as e:
+            logger.error(f"❌ Error loading processed documents: {e}")
+            if self.verbose:
+                import traceback
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+        
+        if new_documents and self.verbose:
+            logger.info(f"📝 Found {len(new_documents)} new documents to process")
+        elif self.verbose:
+            logger.info("✅ All documents already processed - using existing embeddings")
+        
+        return documents
+    
+    def query(self, question: str, session_state: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        Query the legal RAG system.
+        
+        Args:
+            question: User's legal question
+            session_state: Streamlit session state for callbacks
+            
+        Returns:
+            Dict containing answer, sources, and metadata
+        """
+        if not self.qa_chain:
+            if self.ui_only:
+                return {
+                    'error': 'No existing embeddings found. Please run embedding process first.',
+                    'answer': '',
+                    'sources': []
+                }
+            else:
+                return {
+                    'error': 'System not ready. Please load documents first.',
+                    'answer': '',
+                    'sources': []
+                }
+        
+        try:
+            # Add callbacks if in Streamlit context
+            callbacks = []
+            if session_state and 'callback_handler' in session_state:
+                callbacks.append(session_state['callback_handler'])
+            
+            # Run the query
+            if self.verbose:
+                mode_info = " (UI-only mode)" if self.ui_only else ""
+                logger.info(f"🔍 Querying{mode_info}: {question[:100]}...")
+            
+            result = self.qa_chain(
+                {"query": question},
+                callbacks=callbacks
+            )
+            
+            # Extract sources
+            sources = []
+            if 'source_documents' in result:
+                for doc in result['source_documents']:
+                    sources.append({
+                        'content': doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content,
+                        'metadata': doc.metadata
+                    })
+            
+            return {
+                'answer': result.get('result', ''),
+                'sources': sources,
+                'error': None
+            }
             
         except Exception as e:
-            print(f"Error building sentence structures: {e}")
-            self.sentence_windows = []
+            logger.error(f"❌ Query error: {e}")
+            return {
+                'error': str(e),
+                'answer': '',
+                'sources': []
+            }
     
-    def _split_into_sentences(self, text: str) -> List[str]:
-        """Split text into sentences (Albanian-aware)."""
-        import re
+    def process_documents_for_embeddings(self, documents_path: str = "legal_documents/pdfs"):
+        """
+        Process documents and create embeddings - for separate embedding process.
+        This method should be called in embedding-only mode, not in UI mode.
         
-        # Albanian sentence endings
-        sentence_endings = r'[.!?]+(?:\s|$)'
-        sentences = re.split(sentence_endings, text)
-        
-        # Clean and filter sentences
-        cleaned_sentences = []
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if len(sentence) > 10:  # Minimum sentence length
-                cleaned_sentences.append(sentence)
-        
-        return cleaned_sentences
-    
-    def _enhance_albanian_query(self, query: str) -> str:
-        """Enhance Albanian queries with comprehensive legal synonyms and context"""
-        enhanced_query = query.lower()
-        
-        # Comprehensive Albanian legal synonyms for better semantic matching
-        legal_synonyms = {
-            # Employment & Labor Law
-            'punë': 'punë work employment job labor pune punim',
-            'pagë': 'pagë salary wage rrogë compensation pagesë',
-            'rrogë': 'rrogë salary wage pagë income të ardhura',
-            'minimum': 'minimum minim minimale lowest më të ulët bazë',
-            'pushim': 'pushim vacation leave holiday pushimi ditë',
-            'punëtor': 'punëtor employee worker staff punonjës',
-            'punëdhënës': 'punëdhënës employer boss company kompani',
+        Args:
+            documents_path: Path to directory containing PDF documents
+        """
+        if self.ui_only:
+            logger.error("❌ Cannot process documents in UI-only mode. Use full mode for embedding processing.")
+            return False
             
-            # Criminal Law - Enhanced for better matching
-            'dënim': 'dënim punishment penalty sanksion gjykim burgim gjoba',
-            'denimi': 'denimi punishment penalty sanksion gjykim burgim gjoba',
-            'plagosje': 'plagosje injury wound attack assault sulm dhunë',
-            'plagos': 'plagos injure wound attack assault sulm dhunë',
-            'armë': 'armë weapon tool vegël instrument mjete ftohtë',
-            'arme': 'arme weapon tool vegël instrument mjete ftohtë',
-            'ftohtë': 'ftohtë cold steel metalike hekur thikë',
-            'vjedhje': 'vjedhje theft stealing robbery grabitje marrje',
-            'sanksion': 'sanksion penalty punishment dënim gjobë burgim',
-            'gjobë': 'gjobë fine penalty sanksion dënim financiar',
-            'krim': 'krim crime criminal penal vepër penale kundërvajtje',
-            'penal': 'penal criminal crime kod ligj sanksion dënim',
-            'burgim': 'burgim prison jail detention arrest paraburgim',
-            'vrasje': 'vrasje murder killing homicide vdekje ekzekutim',
-            'dhunë': 'dhunë violence force brutality aggression sulm',
-            'sulm': 'sulm attack assault agression dhunë',
+        if not self.embeddings:
+            logger.error("❌ Embeddings not initialized. Cannot process documents.")
+            return False
             
-            # Business & Commercial Law
-            'kompani': 'kompani company business shoqëri enterprise biznes',
-            'biznes': 'biznes business company kompani shoqëri tregtare',
-            'regjistroj': 'regjistroj register establish themelon krijoj',
-            'shoqëri': 'shoqëri company business enterprise kompani',
-            'tregtare': 'tregtare commercial business trading biznes',
+        try:
+            # Check if documents_path ends with /pdfs - if so, use parent directory
+            if documents_path.endswith("/pdfs") or documents_path.endswith("\\pdfs"):
+                # Remove /pdfs since load_documents_from_directory adds it automatically
+                parent_path = str(Path(documents_path).parent)
+                success = self.load_documents_from_directory(parent_path)
+            else:
+                # Use as is - load_documents_from_directory will look for pdfs subdirectory
+                success = self.load_documents_from_directory(documents_path)
             
-            # Family Law
-            'martesë': 'martesë marriage wedding bashkëshort familje',
-            'divorcë': 'divorcë divorce separation ndarje',
-            'fëmijë': 'fëmijë child children kids të mitur',
-            'familje': 'familje family household shtëpi',
-            'prindër': 'prindër parents mother father',
-            
-            # Civil Law
-            'kontrata': 'kontrata contract agreement marrëveshje',
-            'pronë': 'pronë property asset pasuri',
-            'të drejta': 'të drejta rights legal ligjore',
-            'detyrim': 'detyrim obligation duty responsibility',
-            
-            # General Legal Terms
-            'ligj': 'ligj law legal kod juridik ligjor',
-            'kod': 'kod code law ligj juridik',
-            'juridik': 'juridik legal law ligj ligjor',
-            'gjykatë': 'gjykatë court tribunal drejtësi',
-            'avokat': 'avokat lawyer attorney jurist',
-            
-            # Tax & Finance
-            'taksë': 'taksë tax duty detyrim tatim',
-            'tatim': 'tatim tax taksë detyrim financiar',
-            
-            # Constitutional & Administrative
-            'kushtetutë': 'kushtetutë constitution basic law',
-            'shtet': 'shtet state government qeveri',
-            'administrativ': 'administrativ administrative government publik'
-        }
-        
-        # Add relevant synonyms to enhance query
-        for albanian_term, synonyms in legal_synonyms.items():
-            if albanian_term in enhanced_query:
-                enhanced_query += f" {synonyms}"
-        
-        # Add legal context keywords based on query type
-        if any(word in enhanced_query for word in ['sa', 'how much', 'shumë', 'amount']):
-            enhanced_query += " sasi amount vlerë"
-        
-        if any(word in enhanced_query for word in ['si', 'how', 'procedura', 'process']):
-            enhanced_query += " procedurë process hapa steps"
-        
-        if any(word in enhanced_query for word in ['çfarë', 'what', 'cilat', 'which']):
-            enhanced_query += " përkufizim definition detaje specifics"
-        
-        return enhanced_query
-
-
-# Export for backward compatibility
-CloudEnhancedAlbanianLegalRAG = AlbanianLegalRAG
+            if success:
+                if self.verbose:
+                    logger.info(f"✅ Successfully processed documents for embeddings")
+                return True
+            else:
+                if self.verbose:
+                    logger.warning("⚠️ No new documents to process")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to process documents for embeddings: {e}")
+            return False

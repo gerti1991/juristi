@@ -11,8 +11,20 @@ scipy>=1.11.1
 google-generativeai>=0.3.0
 google-cloud-aiplatform>=1.35.0
 
+# LangChain with Google Integration
+langchain>=0.1.0
+langchain-google-genai>=1.0.0
+langchain-community>=0.0.10
+langchain-huggingface>=0.0.3
+chromadb>=0.4.22
+
 # LLM Providers
 groq>=0.4.1
+
+# Hugging Face & BGE embeddings
+transformers>=4.35.0
+huggingface-hub>=0.19.0
+torch>=2.0.0,<2.1.0
 
 # Web Framework & API
 streamlit>=1.28.0
@@ -22,6 +34,7 @@ pydantic>=2.4.2
 
 # Document Processing
 PyPDF2>=3.0.1
+pymupdf>=1.23.0  # Alternative PDF reader (fitz)
 python-docx>=0.8.11
 beautifulsoup4>=4.12.2
 
@@ -32,9 +45,6 @@ aiohttp>=3.8.6
 # Environment & Configuration
 python-dotenv>=1.0.0
 pyyaml>=6.0.1
-
-# PyTorch (with CPU support)
-torch>=2.0.0,<2.1.0
 
 # Additional utilities
 tqdm>=4.66.1

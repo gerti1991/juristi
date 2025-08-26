@@ -27,63 +27,44 @@ MANIFEST
 *.manifest
 *.spec
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# Environments
-.env
-.venv
-env/
+# Virtual environments
 venv/
+env/
 ENV/
-env.bak/
-venv.bak/
+juristi_env/
+.venv/
 
-# Streamlit
-.streamlit/
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
 
-# API Keys and Config
-config.py
+# Environment variables
 .env
-*.key
-secrets.toml
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
-# Data and Cache Files
-*.json
-*.pkl
-*.pickle
-document_embeddings_cache.json
+# ChromaDB & Vector Database
+chroma_db/
+*.sqlite3
+*.db
+
+# Document processing cache
 legal_documents/processed/
-legal_documents/cache/
+*.pickle
 
-# Large PDF files (too big for GitHub)
-legal_documents/pdfs/
-*.pdf
+# Logs
+*.log
+logs/
+streamlit_logs/
+
+# Temporary files
+*.tmp
+*.temp
 
 # OS generated files
 .DS_Store
@@ -94,35 +75,26 @@ legal_documents/pdfs/
 ehthumbs.db
 Thumbs.db
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# PyTorch model cache
+.cache/
+models/
 
-# Logs
-*.log
-logs/
+# Jupyter Notebook
+.ipynb_checkpoints
 
-# Temporary files
-*.tmp
-*.temp
+# API Keys and sensitive data
+secrets.json
+config.json
 
-# Old duplicate files (cleaned up in modular refactor)
-app_old.py
-ai_old.py
-api_old.py
-scraper_old.py
-setup_old.py
-demo*.py
-quick_*.py
-test_individual_*.py
-performance_*.py
+# Test coverage
+htmlcov/
+.coverage
+.pytest_cache/
+
+# Backup files
+*.bak
+*_backup.*
 *_old.*
 
-# Analysis and summary files
-*SUMMARY.md
-*ANALYSIS.md
-PRESENTATION.md
-performance_results_*.json
+# Documentation build
+docs/_build/
