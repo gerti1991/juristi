@@ -24,13 +24,14 @@ current_dir = Path(__file__).parent
 project_root = current_dir.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-# Import the modern RAG engine
+# Import the modern RAG engine and configuration
 from src.juristi.core.rag_engine import AlbanianLegalRAG
+from src.juristi.config import config
 
 # Configure Streamlit page
 st.set_page_config(
-    page_title="Juristi AI - Modern Albanian Legal Assistant",
-    page_icon="⚖️",
+    page_title=config.ui.page_title,
+    page_icon=config.ui.page_icon,
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -72,6 +73,16 @@ st.markdown("""
         border-left: 5px solid #28a745;
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
         margin: 1.5rem 0;
+    }
+    
+    .response-container.analyzed-mode {
+        border-left: 5px solid #6f42c1;
+        background: linear-gradient(135deg, #ffffff, #f8f9ff);
+    }
+    
+    .response-container.precise-mode {
+        border-left: 5px solid #28a745;
+        background: linear-gradient(135deg, #ffffff, #f8fff8);
     }
     
     .source-card {
@@ -205,29 +216,46 @@ def render_sidebar(rag_system: AlbanianLegalRAG):
 
 
 def render_search_interface():
-    """Render the main search interface."""
+    """Render the enhanced dual-mode search interface."""
     st.markdown('<div class="search-container">', unsafe_allow_html=True)
     
     # Search input
-    col1, col2 = st.columns([4, 1])
+    col1, col2 = st.columns([3, 1])
     
     with col1:
         query = st.text_area(
             "🔍 Shkruani pyetjen tuaj ligjore këtu:",
             height=100,
-            placeholder="P.sh. 'Sa vite burgim parashikon ligji për plagosjen e rëndë?' ose 'Çfarë është divorci sipas Kodit Civil?'",
-            help="Mund të shkruani në shqip ose anglisht"
+            placeholder="P.sh. 'Sa dënohet nëse lëviz me makinë në krah të kundërt, në gjendje të dehur, bën aksident dhe vret dy persona?'",
+            help="Mund të shkruani në shqip ose anglisht. Zgjidhni llojin e përgjigjes më poshtë."
         )
     
     with col2:
         st.markdown("<br>", unsafe_allow_html=True)  # Spacing
-        search_clicked = st.button("🔍 Kërko", type="primary", use_container_width=True)
+        
+        # Dual-mode buttons
+        st.markdown("**🎯 Zgjidh llojin e përgjigjes:**")
+        
+        col2a, col2b = st.columns(2)
+        with col2a:
+            precise_clicked = st.button("� Precize", 
+                                      type="secondary", 
+                                      use_container_width=True,
+                                      help="Përgjigje e drejtpërdrejtë nga ligji")
+        
+        with col2b:
+            analyzed_clicked = st.button("🧠 E Analizuar", 
+                                       type="primary", 
+                                       use_container_width=True,
+                                       help="Analizë e detajuar me kombinim informacionesh")
+        
+        st.markdown("---")
         
         # Example queries
         st.markdown("**Shembuj:**")
         example_queries = [
             "plagosje e rëndë dënim",
-            "martesa kushtet ligjore",
+            "makinë krah kundërt + dehur + vrasje",
             "divorci procedura gjyqësore"
         ]
         
@@ -241,46 +269,67 @@ def render_search_interface():
     # Handle example query selection
     if 'example_query' in st.session_state:
         query = st.session_state.example_query
-        search_clicked = True
+        precise_clicked = True  # Default to precise for examples
         del st.session_state.example_query
     
-    return query, search_clicked
+    # Determine search mode and if search was clicked
+    search_clicked = precise_clicked or analyzed_clicked
+    query_mode = "analyzed" if analyzed_clicked else "precise"
+    
+    return query, search_clicked, query_mode
 
 
 def render_response(response: Dict[str, Any], config: Dict[str, Any]):
-    """Render the AI response and sources."""
+    """Render the AI response and sources with enhanced query mode display."""
     if response.get('error'):
         st.error(f"❌ Gabim: {response['error']}")
         return
     
     answer = response.get('answer', '')
     sources = response.get('sources', [])
-    query_time = response.get('query_time', 0)
-    total_docs = response.get('total_documents', 0)
+    query_mode = response.get('query_mode', 'precise')
+    total_sources = len(sources)
     
-    # Response metrics
+    # Enhanced response metrics
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("⏱️ Koha e Përgjigjes", f"{query_time:.2f}s")
+        mode_emoji = "🧠" if query_mode == "analyzed" else "📍"
+        mode_text = "E Analizuar" if query_mode == "analyzed" else "Precize"
+        st.metric("🎯 Lloji i Përgjigjes", f"{mode_emoji} {mode_text}")
     with col2:
-        st.metric("📄 Burimet e Gjetur", total_docs)
+        st.metric("📄 Burimet e Përdorura", total_sources)
     with col3:
-        st.metric("🎯 Statusi", "✅ Sukses")
+        coverage = "Gjërë" if query_mode == "analyzed" else "Specifike"
+        st.metric("🔍 Mbulueshmëria", coverage)
     
-    # AI Response
+    # AI Response with mode-specific styling
     if answer:
-        st.markdown('<div class="response-container">', unsafe_allow_html=True)
-        st.subheader("🤖 Përgjigja e AI-së")
+        if query_mode == "analyzed":
+            st.markdown('<div class="response-container analyzed-mode">', unsafe_allow_html=True)
+            st.subheader("� Analiza e Detajuar Ligjore")
+            st.info("💡 Kjo përgjigje kombinon informacione nga shumë burime ligjore për një analizë të plotë.")
+        else:
+            st.markdown('<div class="response-container precise-mode">', unsafe_allow_html=True)
+            st.subheader("📍 Përgjigja e Precizë Ligjore")
+            st.info("🎯 Kjo përgjigje është bazuar në burimet më relevantet nga dokumentet ligjore.")
+        
         st.markdown(answer)
         st.markdown('</div>', unsafe_allow_html=True)
     
-    # Source documents
+    # Enhanced source documents display
     if sources and config.get('show_sources', True):
-        st.subheader("📚 Dokumentet e Konsideruara")
+        source_title = f"📚 Burimet e Konsideruara ({total_sources} dokumente)"
+        if query_mode == "analyzed":
+            source_title += " - Analizë e Gjërë"
+        
+        st.subheader(source_title)
         
         for i, source in enumerate(sources, 1):
+            # Show first 3 sources expanded in analyzed mode, first 1 in precise mode
+            expanded = (i <= 3) if query_mode == "analyzed" else (i == 1)
+            
             with st.expander(f"📄 Burimi {i}: {source.get('title', 'Pa titull')}", 
-                           expanded=(i == 1)):
+                           expanded=expanded):
                 
                 st.markdown('<div class="source-card">', unsafe_allow_html=True)
                 
@@ -289,10 +338,12 @@ def render_response(response: Dict[str, Any], config: Dict[str, Any]):
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    st.markdown(f"**📍 Burimi:** {source.get('source', 'I panjohur')}")
+                    st.markdown(f"**📍 Burimi:** {metadata.get('source', 'I panjohur')}")
                     st.markdown(f"**📂 Tipi:** {metadata.get('type', 'Dokument ligjor')}")
                 
                 with col2:
+                    if 'page' in metadata:
+                        st.markdown(f"**📄 Faqja:** {metadata['page']}")
                     if 'title' in metadata:
                         st.markdown(f"**📋 Titulli:** {metadata['title']}")
                 
@@ -316,33 +367,43 @@ def main():
     config = render_sidebar(rag_system)
     
     # Render search interface
-    query, search_clicked = render_search_interface()
+    query, search_clicked, query_mode = render_search_interface()
     
     # Process search if triggered
     if search_clicked and query.strip():
+        
+        # Display query mode indicator
+        mode_emoji = "🧠" if query_mode == "analyzed" else "📍"
+        mode_text = "E Analizuar" if query_mode == "analyzed" else "Precize"
+        st.info(f"{mode_emoji} **Mënyra e Kërkimit:** {mode_text}")
+        
         with st.spinner("🔍 Duke kërkuar dhe analizuar dokumentet..."):
             
             # Set up verbose mode for debugging
             if config.get('verbose_mode', True):
                 st.info("🔧 Verbose mode aktiv - shfaqen detajet e procesimit")
             
-            # Execute query
+            # Execute query with mode
             response = rag_system.query(
                 question=query,
-                session_state=st.session_state
+                session_state=st.session_state,
+                query_mode=query_mode
             )
             
             # Store in session state for reference
             st.session_state.last_response = response
             st.session_state.last_query = query
             st.session_state.last_config = config
+            st.session_state.last_query_mode = query_mode
         
         # Render response
         render_response(response, config)
     
     # Show previous response if available
     elif 'last_response' in st.session_state:
-        st.info(f"💭 Rezultatet e fundit për: \"{st.session_state.last_query}\"")
+        mode_emoji = "🧠" if st.session_state.get('last_query_mode') == "analyzed" else "📍"
+        mode_text = "E Analizuar" if st.session_state.get('last_query_mode') == "analyzed" else "Precize"
+        st.info(f"💭 Rezultatet e fundit ({mode_emoji} {mode_text}): \"{st.session_state.last_query}\"")
         render_response(st.session_state.last_response, st.session_state.get('last_config', {}))
     
     # Footer

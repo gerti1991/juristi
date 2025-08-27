@@ -8,11 +8,11 @@ This module provides a FastAPI-based REST API interface:
 - RESTful interface for all system functionality
 
 Main Components:
-- AlbanianLegalAPI: Main API class with all endpoints
+- FastAPI app instance with all endpoints
 - Pydantic models for request/response validation
 - CORS and middleware configuration
 """
 
-from .main import AlbanianLegalAPI, app, create_app
+from .main import app
 
-__all__ = ['AlbanianLegalAPI', 'app', 'create_app']
+__all__ = ['app']

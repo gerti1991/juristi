@@ -102,3 +102,34 @@ htmlcov/
 
 # Documentation build
 docs/_build/
+
+# Node.js and Next.js
+ui-nextjs/node_modules/
+ui-nextjs/.next/
+ui-nextjs/.out/
+ui-nextjs/dist/
+ui-nextjs/build/
+
+# NPM and Yarn
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.eslintcache
+
+# Next.js specific
+.next/
+.vercel
+*.tsbuildinfo
+next-env.d.ts
+
+# TypeScript
+*.tsbuildinfo
+
+# Package managers
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Node.js runtime
+.node_repl_history

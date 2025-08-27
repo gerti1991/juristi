@@ -186,9 +186,8 @@ class AlbanianLegalRAG:
         
         # Initialize components based on mode
         if self.ui_only:
-            # UI-only mode: Skip embedding initialization, only load existing vectorstore and LLM
-            self.embeddings = None
-            self.active_embedding_provider = "unknown"
+            # UI-only mode: Initialize embeddings for search compatibility, load existing vectorstore and LLM
+            self._initialize_embeddings()  # Need embeddings for search to work properly
             self._initialize_llm()
             self._initialize_memory() 
             self._try_load_existing_vectorstore_ui_only()
@@ -210,7 +209,7 @@ class AlbanianLegalRAG:
             logger.info(f"✅ Modern Albanian Legal RAG System initialized ({mode} mode)")
     
     def _try_load_existing_vectorstore_ui_only(self):
-        """Load existing ChromaDB for UI-only mode without embedding initialization."""
+        """Load existing ChromaDB for UI-only mode, using the correctly initialized embeddings."""
         try:
             if not os.path.exists(self.persist_directory):
                 if self.verbose:
@@ -219,22 +218,15 @@ class AlbanianLegalRAG:
                 self.qa_chain = None
                 return False
             
-            # For UI-only mode, create a dummy embedding function that ChromaDB requires
-            # but won't actually be used since we're only querying existing embeddings
-            from langchain_community.vectorstores import Chroma
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-            
-            # Use a lightweight dummy embedding function for UI-only mode
-            dummy_embeddings = HuggingFaceEmbeddings(
-                model_name="all-MiniLM-L6-v2",
-                model_kwargs={'device': 'cpu'},
-                encode_kwargs={'normalize_embeddings': True}
-            )
-            
-            # Load with dummy embedding function - ChromaDB requires this even for queries
+            # The main embeddings should already be initialized.
+            if not self.embeddings:
+                logger.error("❌ Embeddings not initialized in UI-only mode. Cannot load vectorstore.")
+                return False
+
+            # Load with the correct embedding function
             self.vectorstore = Chroma(
                 persist_directory=self.persist_directory,
-                embedding_function=dummy_embeddings
+                embedding_function=self.embeddings
             )
             
             # Check if it has data
@@ -273,41 +265,57 @@ class AlbanianLegalRAG:
     def _initialize_chain_ui_only(self):
         """Initialize QA chain for UI-only mode with existing embeddings."""
         if self.vectorstore is not None and hasattr(self, 'llm'):
-            # Create retriever with MMR for better diversity
+            # Create retriever with MMR for better diversity - improved parameters for Albanian legal search
             retriever = self.vectorstore.as_retriever(
                 search_type="mmr",
                 search_kwargs={
-                    "k": 5,
-                    "fetch_k": 20,
-                    "lambda_mult": 0.7
+                    "k": 15,          # Increased to get more diverse results
+                    "fetch_k": 100,   # Fetch many more candidates for MMR selection  
+                    "lambda_mult": 0.3  # Even more diversity to avoid similar articles
                 }
             )
             
             # Create custom prompt template for Albanian legal questions (UI-only mode)
-            custom_prompt_template = """
-Ti jeni një ekspert juridik për legjislacionin shqiptar. Ju jepet informacion nga dokumentet ligjore dhe duhet të përgjigjeni GJITHMONË me bazë në këto dokumente.
+            custom_prompt_template = """Ti jeni një ekspert i lartë juridik për legjislacionin shqiptar me përvojë profesionale në interpretimin e dokumenteve ligjore. Detyra juaj është të jepni përgjigje të sakta dhe profesionale.
 
-INFORMACION NGA DOKUMENTET LIGJORE:
+**UDHËZIME TË DETYRUESHME KRITIKE:**
+
+**HAPI 1 - IDENTIFIKIMI I DOKUMENTIT TË SAKTË:**
+- PARA çdo gjëje tjetër, IDENTIFIKONI emrin e saktë të dokumentit në çdo burim
+- KËRKONI emrin e ligjit/kodit që përmendet në pyetje (p.sh. "Kodi i Familjes")
+- KONTROLLONI që burimi të përmbajë dokumentin e kërkuar
+
+**HAPI 2 - FILTRIMI I BURIMEVE:**
+- Nëse pyetja kërkon një ligj specifik, IGNORONI të gjitha borimet që NUK janë nga ai ligj
+- KËRKONI vetëm në dokumentet që PËRPUTHEN me ligjin e kërkuar
+- MOS përdorni informacion nga ligje të tjera nëse kërkohet një ligj specifik
+
+**HAPI 3 - PËRGJIGJA PROFESIONALE:**
+
+**PYETJA:** {question}
+
+**TË GJITHA DOKUMENTET E DISPONUESHME:**
 {context}
 
-PYETJA: {question}
+**ANALIZA E DETYRUAR:**
 
-UDHËZIME TË DETYRUESHME:
-1. GJITHMONË jepni një përgjigje të plotë në gjuhën shqipe
-2. Përdorni VETËM informacionin e dhënë nga dokumentet e mësipërme
-3. Nëse gjeni informacion të pjesshëm, kombinojini të gjitha pjesët për të dhënë përgjigjen më të plotë të mundshme
-4. Citoni nenin/nenet e ligjit, kodin ligjor dhe faqen kur është e mundur
-5. Strukturoni përgjigjen tuaj si më poshtë:
+1. **Identifikimi i Burimit të Saktë:**
+   - Cili është ligji/kodi i kërkuar nga pyetja?
+   - Cilat dokumente në kontekst përmbajnë këtë ligj?
+   - A ekziston informacioni i kërkuar në ligjin e duhur?
 
-PËRGJIGJA SHQIP:
-- Filloni me një përmbledhje të shkurtër
-- Jepni detaje të plota nga dokumentet
-- Citoni burimet ligjore specifike
-- Përfundoni me një konkluzion të qartë
+2. **Përgjigja bazuar në analizë:**
 
-MOS thoni kurrë "nuk e di" - përdorni informacionin që keni në dispozicion dhe jepni përgjigjen më të mirë të mundshme.
+Nëse GJENI informacionin në ligjin e kërkuar:
+"✅ **PËRGJIGJA E SAKTË NGA [Emri i Ligjit të Kërkuar]:** [Informacioni i plotë]"
 
-PËRGJIGJA:"""
+Nëse informacioni NGJASJON të ekzistojë por nga një ligj tjetër:
+"⚠️ **KUJDES - LIGJ I GABUAR:** Gjeta informacion për [detajet], por është nga [Ligji Aktual], jo nga [Ligji i Kërkuar]. Informacioni i gabuar: [detajet]"
+
+Nëse NUK gjeni fare informacionin në ligjin e kërkuar:
+"❌ **INFORMACION I PAGJETUR:** Në [Ligji i Kërkuar] nuk gjej informacion për [detajet e pyetjes]. Ka mundësi që ky informacion të mos ekzistojë në këtë ligj."
+
+**CITIMI I DETYRUAR:** Emri i saktë i dokumentit + neni + faqja."""
 
             custom_prompt = PromptTemplate(
                 template=custom_prompt_template,
@@ -335,11 +343,24 @@ PËRGJIGJA:"""
                 logger.warning("⚠️ Cannot initialize QA chain - missing vectorstore or LLM")
     
     def _initialize_embeddings(self):
-        """Initialize embeddings with strict priority: Google -> BGE -> all-MiniLM-L6-v2."""
+        """Initialize embeddings with configurable priority based on EMBEDDING_PROVIDER env var."""
         self.embeddings = None
         
-        # Fixed priority order as requested
-        embedding_providers = ["google", "bge", "sentence-transformers"]
+        # Check if specific provider is requested via environment variable
+        preferred_provider = os.getenv("EMBEDDING_PROVIDER", "google").lower()
+        
+        # Build the priority list dynamically
+        all_providers = ["google", "bge", "sentence-transformers"]
+        if preferred_provider in all_providers:
+            # Start with the preferred provider
+            embedding_providers = [preferred_provider]
+            # Add the rest as fallbacks
+            for p in all_providers:
+                if p != preferred_provider:
+                    embedding_providers.append(p)
+        else:
+            # Default priority order if the preferred one is invalid
+            embedding_providers = all_providers
         
         for provider in embedding_providers:
             try:
@@ -448,10 +469,14 @@ PËRGJIGJA:"""
             chunk_size=1000,
             chunk_overlap=200,
             length_function=len,
-            separators=["\n\n", "\n", ".", "!", "?", ";", ",", " ", ""]
+            # Prioritize splitting on legal articles ("Neni"), then sections, then paragraphs
+            separators=[
+                "\nNeni ", "\nKREU ", "\nPJESA ", "\nSEKSIONI ",  # Albanian legal structure
+                "\n\n", "\n", ". ", "; ", ", ", " ", ""
+            ]
         )
         if self.verbose:
-            logger.info("✅ Text splitter initialized")
+            logger.info("✅ Text splitter initialized for legal documents")
     
     def _initialize_vectorstore(self):
         """Initialize vectorstore - will be created when documents are loaded."""
@@ -587,36 +612,57 @@ PËRGJIGJA:"""
     def _initialize_chain(self):
         """Initialize the QA chain."""
         if self.vectorstore is not None:
-            # Configure MMR retriever as requested
+            # Configure MMR retriever as requested - increased parameters for better Albanian legal search
             retriever = self.vectorstore.as_retriever(
                 search_type="mmr",  # Maximum Marginal Relevance
                 search_kwargs={
-                    "k": 5,           # Number of documents to return
-                    "fetch_k": 20,    # Number of documents to fetch before MMR
-                    "lambda_mult": 0.7  # Diversity parameter (0=max diversity, 1=min diversity)
+                    "k": 15,          # Number of documents to return (increased)
+                    "fetch_k": 100,   # Number of documents to fetch before MMR (increased)
+                    "lambda_mult": 0.3  # Even more diversity for better coverage
                 }
             )
             
             # Create custom prompt template for Albanian legal questions
-            custom_prompt_template = """
-Ti jeni një asistent juridik ekspert për legjislacionin shqiptar. Juve ju janë dhënë disa dokumente ligjore dhe një pyetje e përdoruesit. 
+            custom_prompt_template = """Ti jeni një ekspert i lartë juridik për legjislacionin shqiptar me përvojë profesionale në interpretimin e dokumenteve ligjore. Detyra juaj është të jepni përgjigje të sakta dhe profesionale.
 
-DOKUMENTE LIGJORE:
+**UDHËZIME TË DETYRUESHME KRITIKE:**
+
+**HAPI 1 - IDENTIFIKIMI I DOKUMENTIT TË SAKTË:**
+- PARA çdo gjëje tjetër, IDENTIFIKONI emrin e saktë të dokumentit në çdo burim
+- KËRKONI emrin e ligjit/kodit që përmendet në pyetje (p.sh. "Kodi i Familjes")
+- KONTROLLONI që burimi të përmbajë dokumentin e kërkuar
+
+**HAPI 2 - FILTRIMI I BURIMEVE:**
+- Nëse pyetja kërkon një ligj specifik, IGNORONI të gjitha borimet që NUK janë nga ai ligj
+- KËRKONI vetëm në dokumentet që PËRPUTHEN me ligjin e kërkuar
+- MOS përdorni informacion nga ligje të tjera nëse kërkohet një ligj specifik
+
+**HAPI 3 - PËRGJIGJA PROFESIONALE:**
+
+**PYETJA:** {question}
+
+**TË GJITHA DOKUMENTET E DISPONUESHME:**
 {context}
 
-PYETJA E PËRDORUESIT: {question}
+**ANALIZA E DETYRUAR:**
 
-UDHËZIME TË DOMOSDOSHME:
-1. GJITHMONË jepni një përgjigje të plotë në gjuhën shqipe
-2. GJITHMONË analizoni dhe sintetizoni të gjitha informacionet nga dokumentet e dhëna
-3. MOS thoni kurrë "nuk e di" ose "nuk kam informacion" - jepni gjithçka që gjetët në dokumente
-4. GJITHMONË citoni nenin/nenet specifike të ligjit dhe emrin e dokumentit
-5. ORGANIZONI përgjigjen në mënyrë të strukturuar:
-   - Përmbledhje e shkurtër e përgjigjes
-   - Detaje të plotë nga legjislacioni
-   - Referencat specifike të ligjit
+1. **Identifikimi i Burimit të Saktë:**
+   - Cili është ligji/kodi i kërkuar nga pyetja?
+   - Cilat dokumente në kontekst përmbajnë këtë ligj?
+   - A ekziston informacioni i kërkuar në ligjin e duhur?
 
-PËRGJIGJA (në gjuhën shqipe):"""
+2. **Përgjigja bazuar në analizë:**
+
+Nëse GJENI informacionin në ligjin e kërkuar:
+"✅ **PËRGJIGJA E SAKTË NGA [Emri i Ligjit të Kërkuar]:** [Informacioni i plotë]"
+
+Nëse informacioni NGJASJON të ekzistojë por nga një ligj tjetër:
+"⚠️ **KUJDES - LIGJ I GABUAR:** Gjeta informacion për [detajet], por është nga [Ligji Aktual], jo nga [Ligji i Kërkuar]. Informacioni i gabuar: [detajet]"
+
+Nëse NUK gjeni fare informacionin në ligjin e kërkuar:
+"❌ **INFORMACION I PAGJETUR:** Në [Ligji i Kërkuar] nuk gjej informacion për [detajet e pyetjes]. Ka mundësi që ky informacion të mos ekzistojë në këtë ligj."
+
+**CITIMI I DETYRUAR:** Emri i saktë i dokumentit + neni + faqja."""
 
             custom_prompt = PromptTemplate(
                 template=custom_prompt_template,
@@ -1167,23 +1213,20 @@ PËRGJIGJA (në gjuhën shqipe):"""
         new_documents = []
         
         try:
-            # Import PDF processing libraries
+            # Import PDF processing libraries, prioritizing PyMuPDF (fitz)
             try:
-                import PyPDF2
+                import fitz  # PyMuPDF
                 PDF_READER_AVAILABLE = True
+                PDF_READER_TYPE = "pymupdf"
             except ImportError:
                 try:
-                    import fitz  # PyMuPDF
+                    import PyPDF2
                     PDF_READER_AVAILABLE = True
-                    PDF_READER_TYPE = "pymupdf"
+                    PDF_READER_TYPE = "pypdf2"
                 except ImportError:
                     if self.verbose:
-                        logger.warning("⚠️ No PDF reader available (PyPDF2 or PyMuPDF). Install with: pip install PyPDF2 or pip install PyMuPDF")
+                        logger.warning("⚠️ No PDF reader available (PyMuPDF or PyPDF2). Install with: pip install PyMuPDF")
                     return documents
-                else:
-                    PDF_READER_TYPE = "pymupdf"
-            else:
-                PDF_READER_TYPE = "pypdf2"
             
             if not PDF_READER_AVAILABLE:
                 return documents
@@ -1388,13 +1431,14 @@ PËRGJIGJA (në gjuhën shqipe):"""
         
         return documents
     
-    def query(self, question: str, session_state: Optional[Dict] = None) -> Dict[str, Any]:
+    def query(self, question: str, session_state: Optional[Dict] = None, query_mode: str = "precise") -> Dict[str, Any]:
         """
-        Query the legal RAG system.
+        Query the legal RAG system with enhanced dual-mode responses.
         
         Args:
             question: User's legal question
             session_state: Streamlit session state for callbacks
+            query_mode: "precise" for direct answers or "analyzed" for comprehensive analysis
             
         Returns:
             Dict containing answer, sources, and metadata
@@ -1419,15 +1463,20 @@ PËRGJIGJA (në gjuhën shqipe):"""
             if session_state and 'callback_handler' in session_state:
                 callbacks.append(session_state['callback_handler'])
             
-            # Run the query
+            # Run the query based on mode
             if self.verbose:
                 mode_info = " (UI-only mode)" if self.ui_only else ""
-                logger.info(f"🔍 Querying{mode_info}: {question[:100]}...")
+                logger.info(f"🔍 Querying{mode_info} in '{query_mode}' mode: {question[:100]}...")
             
-            result = self.qa_chain(
-                {"query": question},
-                callbacks=callbacks
-            )
+            if query_mode == "analyzed":
+                # For analyzed mode, use a more comprehensive query approach
+                result = self._query_analyzed_mode(question, callbacks)
+            else:
+                # Default precise mode - use existing chain
+                result = self.qa_chain(
+                    {"query": question},
+                    callbacks=callbacks
+                )
             
             # Extract sources
             sources = []
@@ -1441,7 +1490,8 @@ PËRGJIGJA (në gjuhën shqipe):"""
             return {
                 'answer': result.get('result', ''),
                 'sources': sources,
-                'error': None
+                'error': None,
+                'query_mode': query_mode
             }
             
         except Exception as e:
@@ -1449,9 +1499,87 @@ PËRGJIGJA (në gjuhën shqipe):"""
             return {
                 'error': str(e),
                 'answer': '',
-                'sources': []
+                'sources': [],
+                'query_mode': query_mode
             }
     
+    def _query_analyzed_mode(self, question: str, callbacks: List = None) -> Dict[str, Any]:
+        """
+        Execute a query in analyzed mode - comprehensive analysis with multiple chunk synthesis.
+        """
+        # First get more documents for comprehensive analysis
+        docs = self.vectorstore.similarity_search_with_relevance_scores(
+            question, 
+            k=20,  # Get more documents for analysis
+            score_threshold=0.3  # Lower threshold for broader coverage
+        )
+        
+        if not docs:
+            return {
+                'result': 'Nuk u gjetën dokumente të përshtatshme për këtë pyetje.',
+                'source_documents': []
+            }
+        
+        # Extract documents and scores
+        documents = [doc for doc, score in docs]
+        
+        # Create comprehensive analysis prompt
+        analyzed_prompt_template = """Ti jeni një ekspert i lartë juridik shqiptar me përvojë të gjerë në analizën e rasteve komplekse ligjore. Detyra juaj është të analizoni pyetjen e dhënë duke kombinuar informacione nga disa burime ligjore dhe të jepni një përgjigje të detajuar dhe të analizuar.
+
+**ANALIZA E DETYRUAR - MËNYRË ANALITIKE:**
+
+1. **Identifikimi i Elementeve Ligjorë:**
+   - Identifikoni të gjitha elementet e ndryshme ligjore të përfshira në pyetje
+   - Ndani pyetjen në pjesë më të vogla për analizë sistematike
+
+2. **Kombinimi i Informacioneve:**
+   - Kombinoni informacione nga burime të ndryshme ligjore
+   - Bëni llogaritje dhe analizë kur është e nevojshme
+   - Konsideroni rrethanat përkeqësuese dhe zbutëse
+
+3. **Përgjigja e Analizuar:**
+   - Jepni një përgjigje të detajuar që kombinon elementet e ndryshëm
+   - Përmendni të gjitha ligjet/kodet e përfshira
+   - Bëni llogaritje specifike kur pyetja kërkon (p.sh., total vite burgimi)
+   - Citoni burimet specifike për çdo element
+
+**KËRKESA E VEÇANTË:** Kur shkruani numra, përdorni fjalët në vend të shifrave (p.sh., "një" në vend të "1", "dy" në vend të "2").
+
+**KONTEKSTI LIGJOR:**
+{context}
+
+**PYETJA:** {question}
+
+**PËRGJIGJA E ANALIZUAR (në shqip):**"""
+
+        # Create analyzed prompt
+        analyzed_prompt = PromptTemplate(
+            template=analyzed_prompt_template,
+            input_variables=["context", "question"]
+        )
+        
+        # Prepare context from all documents
+        context = "\n\n---\n\n".join([
+            f"BURIMI {i+1}: {doc.metadata.get('source', 'Unknown')}\n{doc.page_content}"
+            for i, doc in enumerate(documents)
+        ])
+        
+        # Generate response using LLM directly for analyzed mode
+        try:
+            formatted_prompt = analyzed_prompt.format(context=context, question=question)
+            response = self.llm.invoke(formatted_prompt)
+            
+            return {
+                'result': response.content if hasattr(response, 'content') else str(response),
+                'source_documents': documents
+            }
+        except Exception as e:
+            logger.error(f"❌ Error in analyzed mode: {e}")
+            return {
+                'result': f'Gabim në përpunimin e pyetjes në mënyrën analitike: {e}',
+                'source_documents': documents
+            }
+
     def process_documents_for_embeddings(self, documents_path: str = "legal_documents/pdfs"):
         """
         Process documents and create embeddings - for separate embedding process.

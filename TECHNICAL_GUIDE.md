@@ -26,12 +26,14 @@
 ### **Minimum Requirements**
 - **OS**: Windows 10+, macOS 10.14+, or Linux Ubuntu 18.04+
 - **Python**: 3.9+ (3.11 recommended)
+- **Node.js**: 18+ (for Next.js frontend, optional)
 - **RAM**: 4GB minimum (8GB recommended)
 - **Storage**: 2GB for application + 1GB per 1000 legal document pages
 - **Network**: Internet connection for AI services
 
 ### **Recommended Setup**
 - **Python**: 3.11.x for optimal performance
+- **Node.js**: 18.x or 20.x LTS for frontend development
 - **RAM**: 8-16GB for large document collections
 - **CPU**: Multi-core processor for faster embedding processing
 - **Storage**: SSD for better ChromaDB performance
@@ -69,6 +71,11 @@ pip install -r requirements.txt
 
 # For development (optional)
 pip install -r requirements-dev.txt
+
+# Install Node.js dependencies (for Next.js frontend)
+cd ui-nextjs
+npm install
+cd ..
 ```
 
 ### **Step 3: Environment Configuration**
@@ -80,12 +87,24 @@ cp .env.example .env
 # Edit .env file with your configuration
 notepad .env  # Windows
 nano .env     # Linux/macOS
+
+# For Next.js (optional)
+cd ui-nextjs
+cp .env.example .env.local  # If .env.example exists
+cd ..
 ```
 
 **Environment Variables:**
 ```env
+# Python Environment (.env)
 # API Keys (Optional - system has fallbacks)
 GOOGLE_API_KEY=your_google_api_key_here
+
+# Next.js Environment (ui-nextjs/.env.local)
+# FastAPI Backend URL  
+NEXT_PUBLIC_API_URL=http://localhost:8000
+NEXT_PUBLIC_APP_NAME="Juristi AI"
+```
 GEMINI_API_KEY=your_gemini_api_key_here
 
 # Model Configuration
@@ -115,10 +134,50 @@ VERBOSE=true
                                 │                        │
                                 ▼                        │
 ┌─────────────────┐    ┌─────────────────┐              │
-│ User Interface  │◀───│ RAG Engine      │◀─────────────┘
-│ (Streamlit)     │    │ (LangChain)     │
-└─────────────────┘    └─────────────────┘
-                                │
+│ User Interfaces │◀───│ RAG Engine      │◀─────────────┘
+│                 │    │ (LangChain)     │
+│ • Next.js Web   │    └─────────────────┘
+│ • FastAPI       │             │
+│ • Streamlit     │             ▼
+└─────────────────┘    ┌─────────────────┐
+                       │ LLM Providers   │
+                       │ • Google Gemini │
+                       │ • Fallback LLMs │
+                       └─────────────────┘
+```
+
+### **Multi-Interface Architecture**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Client Layer                         │
+├─────────────────┬─────────────────┬─────────────────────────┤
+│   Next.js Web   │   Streamlit UI  │   Direct API Access     │
+│   (Port 3000)   │   (Port 8501)   │   (curl, scripts, etc)  │
+└─────────┬───────┴─────────┬───────┴─────────────────┬───────┘
+          │                 │                         │
+          │                 │                         │
+          ▼                 ▼                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     FastAPI Backend                         │
+│                      (Port 8000)                            │
+├─────────────────────────────────────────────────────────────┤
+│  • /search    (POST) - Precise queries                     │
+│  • /analyse   (POST) - Comprehensive analysis              │
+│  • /docs      (GET)  - Interactive API documentation       │
+│  • /          (GET)  - Health check                        │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     RAG Engine Core                         │
+├─────────────────────────────────────────────────────────────┤
+│  • LangChain RetrievalQA Chain                             │
+│  • Multi-provider embedding system                         │
+│  • ChromaDB vector database                                │
+│  • Google Gemini LLM integration                           │
+└─────────────────────────────────────────────────────────────┘
+```
                                 ▼
                        ┌─────────────────┐
                        │ LLM Service     │
@@ -231,9 +290,51 @@ The system automatically normalizes all embeddings to **384 dimensions** using P
 
 ---
 
-## 🎨 **User Interface Setup**
+## 🎨 **Multi-Interface Setup**
 
-### **Step 1: Launch the Application**
+The Juristi AI system provides three different interfaces to suit various use cases:
+
+### **🌐 Option 1: Next.js Web Application (Production Ready)**
+
+#### **Step 1: Install Node.js Dependencies**
+
+```bash
+# Navigate to frontend directory
+cd ui-nextjs
+
+# Install dependencies
+npm install
+
+# Return to root directory
+cd ..
+```
+
+#### **Step 2: Start FastAPI Backend**
+
+```bash
+# Method 1: Using main.py launcher
+python main.py api
+
+# Method 2: Direct uvicorn command
+uvicorn src.juristi.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+#### **Step 3: Start Next.js Frontend**
+
+```bash
+# In a new terminal
+cd ui-nextjs
+npm run dev
+```
+
+#### **Step 4: Access the Application**
+
+- **Frontend**: `http://localhost:3000` (Modern web interface)
+- **API Docs**: `http://localhost:8000/docs` (Interactive API documentation)
+
+### **📊 Option 2: Streamlit Interface (Development/Prototyping)**
+
+#### **Step 1: Launch Streamlit**
 
 ```bash
 # Method 1: Direct launch
@@ -242,29 +343,68 @@ streamlit run src/juristi/ui/modern_main.py
 # Method 2: Using launcher script
 python scripts/run_streamlit.py
 
+# Method 3: Using main.py
+python main.py ui
+
 # Custom port
 streamlit run src/juristi/ui/modern_main.py --server.port 8502
 ```
 
-### **Step 2: Access the Interface**
+#### **Step 2: Access Streamlit**
 
 1. Open your browser
 2. Navigate to `http://localhost:8501`
 3. Wait for the system to initialize
 4. Start querying!
 
+### **🔧 Option 3: API Only (Integration/Development)**
+
+#### **FastAPI Standalone**
+
+```bash
+# Start API server only
+uvicorn src.juristi.api.main:app --host 0.0.0.0 --port 8000
+
+# Test with curl
+curl -X POST "http://localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Cilat janë kushtet për divorcin?", "mode": "precise"}'
+```
+
+### **Interface Comparison**
+
+| Feature | Next.js Web App | Streamlit | FastAPI Only |
+|---------|-----------------|-----------|--------------|
+| **Production Ready** | ✅ Yes | ⚠️ Prototype | 🔧 Integration |
+| **Mobile Responsive** | ✅ Yes | ❌ Limited | 🔧 API Only |
+| **Performance** | ⚡ Excellent | ⚡ Good | ⚡ Fastest |
+| **User Experience** | 🎨 Professional | 📊 Functional | 🔌 Programmatic |
+| **Customization** | ✅ Full Control | ⚠️ Limited | 🔧 Full API |
+| **Deployment** | 🌐 Vercel/Netlify | 📊 Streamlit Cloud | 🐳 Docker/K8s |
+
 ### **Interface Features**
 
-#### **Main Query Interface**
-- **Query Input**: Multi-language support (Albanian/English)
-- **Response Display**: Formatted legal analysis
-- **Source Attribution**: Document citations with page numbers
-- **Conversation History**: Context-aware follow-up questions
+#### **Next.js Web Application**
+- **Modern UI/UX**: Grok AI-inspired professional design
+- **Dual-Mode Interface**: Visual mode selection (Precise/Analyzed)
+- **Real-time Processing**: Loading states and progress indicators
+- **Responsive Design**: Works on desktop, tablet, and mobile
+- **Source Display**: Enhanced source verification with metadata
+- **TypeScript**: Full type safety and developer experience
 
-#### **Sidebar Options**
-- **System Status**: Embedding provider, document count
-- **Query Settings**: Search parameters, response length
-- **Document Management**: Processing status, index information
+#### **Streamlit Interface**  
+- **Quick Setup**: Zero configuration required
+- **Interactive Components**: Built-in Streamlit widgets
+- **Real-time Updates**: Live query processing
+- **Sidebar Controls**: System settings and status
+- **Conversation History**: Session-based query memory
+
+#### **FastAPI REST API**
+- **OpenAPI Documentation**: Interactive Swagger UI at `/docs`
+- **RESTful Endpoints**: Standard HTTP methods
+- **JSON Responses**: Structured data format
+- **CORS Support**: Cross-origin requests enabled
+- **Error Handling**: Detailed error responses with status codes
 
 ---
 
@@ -456,7 +596,81 @@ python scripts/process_embeddings.py --documents-path test_docs/
 
 ## 🚀 **Production Deployment**
 
-### **Docker Deployment**
+### **🌐 Next.js + FastAPI (Recommended)**
+
+#### **Docker Compose Deployment**
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./legal_documents:/app/legal_documents
+    
+  nextjs:
+    build:
+      context: ./ui-nextjs
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://fastapi:8000
+    depends_on:
+      - fastapi
+```
+
+#### **Separate Service Deployment**
+
+**FastAPI Backend (Dockerfile.api):**
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+EXPOSE 8000
+
+CMD ["uvicorn", "src.juristi.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+**Next.js Frontend (ui-nextjs/Dockerfile):**
+```dockerfile
+FROM node:18-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY . .
+COPY --from=deps /app/node_modules ./node_modules
+RUN npm run build
+
+FROM node:18-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV production
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+### **📊 Streamlit Deployment (Development)**
+
+#### **Simple Docker Deployment**
 
 ```dockerfile
 FROM python:3.11-slim
@@ -471,26 +685,46 @@ EXPOSE 8501
 CMD ["streamlit", "run", "src/juristi/ui/modern_main.py", "--server.port=8501", "--server.address=0.0.0.0"]
 ```
 
-### **Environment Setup**
+#### **Environment Setup**
 ```bash
 # Build and run
 docker build -t juristi-ai .
 docker run -p 8501:8501 juristi-ai
 ```
 
-### **Cloud Deployment Options**
+### **☁️ Cloud Deployment Options**
 
-#### **Streamlit Cloud**
+#### **Vercel (Next.js Frontend)**
+```bash
+# Install Vercel CLI
+npm i -g vercel
+
+# Deploy frontend
+cd ui-nextjs
+vercel --prod
+
+# Set environment variables in Vercel dashboard
+NEXT_PUBLIC_API_URL=https://your-api-domain.com
+```
+
+#### **Railway/Render (FastAPI Backend)**
+1. Push to GitHub
+2. Connect to Railway/Render
+3. Set build command: `pip install -r requirements.txt`
+4. Set start command: `uvicorn src.juristi.api.main:app --host 0.0.0.0 --port $PORT`
+5. Configure environment variables
+
+#### **Streamlit Cloud (Streamlit UI)**
 1. Push to GitHub
 2. Connect to Streamlit Cloud
 3. Configure environment variables
 4. Deploy automatically
 
-#### **AWS/GCP/Azure**
-- Use container services
-- Configure environment variables
-- Set up persistent storage for ChromaDB
-- Monitor API quotas and usage
+#### **AWS/GCP/Azure (Full Stack)**
+- **Frontend**: Static site hosting (S3 + CloudFront, Vercel, Netlify)
+- **Backend**: Container services (ECS, Cloud Run, Container Apps)
+- **Database**: Persistent storage for ChromaDB
+- **Environment**: Secret management for API keys
 
 ---
 
