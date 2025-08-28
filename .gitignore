@@ -133,3 +133,15 @@ pnpm-lock.yaml
 
 # Node.js runtime
 .node_repl_history
+
+# WhatsApp/PyWhatKit remnants
+PyWhatKit_DB.txt
+
+# Telegram bot logs
+telegram_bot.log
+
+# Development tools
+dev_tools.py
+
+# Local configuration examples
+.env.example.local

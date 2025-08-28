@@ -81,6 +81,20 @@ def run_api():
         sys.exit(1)
 
 
+def run_telegram_bot():
+    """Launch Telegram bot integration."""
+    logger = logging.getLogger(__name__)
+    logger.info("🤖 Starting Telegram bot...")
+    
+    try:
+        from scripts.telegram_bot import main as telegram_main
+        telegram_main()
+    except Exception as e:
+        logger.error(f"❌ Telegram bot failed: {e}")
+        logger.info("💡 Install required packages: pip install python-telegram-bot")
+        sys.exit(1)
+
+
 def validate_system():
     """Validate system configuration and dependencies."""
     logger = logging.getLogger(__name__)
@@ -198,13 +212,14 @@ Examples:
   python main.py process             # Process embeddings
   python main.py ui                  # Start Streamlit UI
   python main.py api                 # Start API server
+  python main.py telegram            # Start Telegram bot
   python main.py rebuild             # Rebuild index
         """
     )
     
     parser.add_argument(
         "command",
-        choices=["status", "validate", "process", "ui", "api", "rebuild"],
+        choices=["status", "validate", "process", "ui", "api", "telegram", "rebuild"],
         help="Command to execute"
     )
     
@@ -234,6 +249,8 @@ Examples:
             run_ui()
         elif args.command == "api":
             run_api()
+        elif args.command == "telegram":
+            run_telegram_bot()
         elif args.command == "rebuild":
             rebuild_index()
     except KeyboardInterrupt:

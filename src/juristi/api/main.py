@@ -147,8 +147,8 @@ async def search_documents(request: SearchRequest):
                             id=f"source_{i}",
                             title=source.metadata.get('source', 'Unknown Document'),
                             content=source.page_content[:500],  # Limit content length
-                            score=0.0,
-                            metadata=source.metadata
+                            source=source.metadata.get('source', 'Unknown Document'),
+                            similarity_score=0.0
                         ))
                     elif isinstance(source, dict):
                         # Dictionary format
@@ -156,8 +156,8 @@ async def search_documents(request: SearchRequest):
                             id=f"source_{i}",
                             title=source.get('metadata', {}).get('source', 'Unknown Document'),
                             content=source.get('page_content', source.get('content', ''))[:500],
-                            score=source.get('score', 0.0),
-                            metadata=source.get('metadata', {})
+                            source=source.get('metadata', {}).get('source', 'Unknown Document'),
+                            similarity_score=source.get('score', 0.0)
                         ))
                     else:
                         print(f"DEBUG: Unknown source format: {type(source)}")
