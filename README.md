@@ -80,17 +80,61 @@ cp .env.example .env
 # - TELEGRAM_BOT_TOKEN=your_bot_token (optional)
 ```
 
-### 3. Process Legal Documents
+### 3. Add Legal Documents
 
 ```bash
-# Process and embed legal documents
-python main.py process
+# The system expects Albanian legal documents in PDF format
+# Add your PDF files to the legal_documents/pdfs/ folder
 
-# Verify system status
-python main.py validate
+# Example structure:
+legal_documents/
+└── pdfs/
+    ├── Kodi CIVIL 2023.pdf
+    ├── Kodi i punes -LIGJ- 2024.pdf
+    ├── Kodi Penal.pdf
+    └── ... (your other legal PDFs)
 ```
 
-### 4. Start Services
+**📚 Currently Included Documents (19+ Albanian Legal Codes):**
+- Kodi Civil 2023
+- Kodi i Punës 2024  
+- Kodi Penal i përditësuar
+- Kodi Procedurës Civile (LIGJ 8116-1996)
+- Kodi i Familjes (Ligj 9062/2003)
+- Kodi Doganor i RSH
+- Kodi Hekurudhor i RSH
+- Kodi Ajror 2018
+- And many more Albanian legal regulations...
+
+### 4. Process Legal Documents & Create Embeddings
+
+```bash
+# IMPORTANT: Process documents BEFORE first use
+# This creates the vector database for AI search
+
+# Process and embed all legal documents
+python main.py process
+
+# This will:
+# 1. Read all PDFs from legal_documents/pdfs/
+# 2. Extract and chunk text content
+# 3. Generate embeddings using Google AI
+# 4. Store in ChromaDB vector database
+# 5. Create search indexes
+
+# Verify system status and document count
+python main.py validate
+
+# Expected output: "✅ System ready with X documents loaded"
+```
+
+**⚠️ Important Notes:**
+- First run takes 5-15 minutes depending on document count
+- Requires internet connection for Google AI embeddings
+- Creates `chroma_db/` folder with vector database
+- Process again when adding new legal documents
+
+### 5. Start Services
 
 #### Option A: Web Interface (Next.js)
 ```bash
@@ -136,7 +180,30 @@ python main.py telegram
   - `/analyze [question]` - Comprehensive analysis
   - Direct messages work too!
 
-## 📁 Project Structure
+## �️ Troubleshooting
+
+### Document Processing Issues
+```bash
+# If embedding process fails:
+# 1. Check internet connection (Google AI required)
+# 2. Verify API key in .env file
+# 3. Ensure PDFs are readable (not scanned images)
+
+# Reset embeddings database
+rm -rf chroma_db/  # On Windows: Remove-Item chroma_db -Recurse -Force
+python main.py process
+
+# Check system status
+python main.py validate
+```
+
+### Common Issues
+- **"No documents loaded"**: Add PDF files to `legal_documents/pdfs/` folder
+- **Google AI errors**: Check `GOOGLE_API_KEY` in `.env` file  
+- **Slow processing**: Large PDFs take time; process runs in background
+- **Memory issues**: Process documents in smaller batches if needed
+
+## �📁 Project Structure
 
 ```
 juristi/
