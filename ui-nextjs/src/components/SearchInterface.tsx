@@ -13,12 +13,49 @@ interface SearchResponse {
   mode: 'precise' | 'analyzed';
 }
 
-export default function SearchInterface() {
+interface SearchInterfaceProps {
+  language: 'al' | 'en';
+}
+
+export default function SearchInterface({ language }: SearchInterfaceProps) {
   const [query, setQuery] = useState('');
   const [selectedMode, setSelectedMode] = useState<'precise' | 'analyzed'>('precise');
   const [isLoading, setIsLoading] = useState(false);
   const [response, setResponse] = useState<SearchResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const translations = {
+    al: {
+      preciseMode: "Kërkimi i Saktë",
+      preciseDescription: "Përgjigje të shpejta dhe të drejtpërdrejta nga dokumentet ligjore",
+      analyzedMode: "Analiza e Thelluar", 
+      analyzedDescription: "Analizë gjithëpërfshirëse me kontekst dhe shpjegime të detajuara",
+      placeholder: "Shkruani pyetjen tuaj ligjore këtu në shqip ose anglisht...",
+      searchButton: "Kërko",
+      searching: "Duke kërkuar...",
+      answer: "Përgjigja",
+      sources: "Burimet",
+      errorTitle: "Ka ndodhur një gabim",
+      tryAgain: "Provoni përsëri",
+      page: "Faqja"
+    },
+    en: {
+      preciseMode: "Precise Search",
+      preciseDescription: "Quick, direct answers from legal documents",
+      analyzedMode: "Deep Analysis",
+      analyzedDescription: "Comprehensive analysis with context and detailed explanations", 
+      placeholder: "Type your legal question here in Albanian or English...",
+      searchButton: "Search",
+      searching: "Searching...",
+      answer: "Answer",
+      sources: "Sources",
+      errorTitle: "An error occurred",
+      tryAgain: "Try again",
+      page: "Page"
+    }
+  };
+
+  const t = translations[language];
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -68,7 +105,10 @@ export default function SearchInterface() {
           }`}
         >
           <Target size={20} />
-          📍 Precize
+          <div className="text-left">
+            <div className="font-medium">📍 {t.preciseMode}</div>
+            <div className="text-xs text-gray-400">{t.preciseDescription}</div>
+          </div>
         </button>
         <button
           onClick={() => setSelectedMode('analyzed')}
@@ -79,7 +119,10 @@ export default function SearchInterface() {
           }`}
         >
           <Brain size={20} />
-          🧠 E Analizuar
+          <div className="text-left">
+            <div className="font-medium">🧠 {t.analyzedMode}</div>
+            <div className="text-xs text-gray-400">{t.analyzedDescription}</div>
+          </div>
         </button>
       </div>
 
@@ -89,7 +132,7 @@ export default function SearchInterface() {
           <textarea
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Ask your legal question in Albanian or English..."
+            placeholder={t.placeholder}
             className="w-full p-4 pr-12 bg-gray-900 border border-gray-700 rounded-lg text-white placeholder-gray-400 focus:border-blue-500 focus:outline-none resize-none"
             rows={3}
             disabled={isLoading}
@@ -98,6 +141,7 @@ export default function SearchInterface() {
             type="submit"
             disabled={!query.trim() || isLoading}
             className="absolute bottom-4 right-4 p-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg transition-colors"
+            title={isLoading ? t.searching : t.searchButton}
           >
             {isLoading ? (
               <Loader size={20} className="animate-spin" />
@@ -111,7 +155,7 @@ export default function SearchInterface() {
       {/* Error Display */}
       {error && (
         <div className="mb-6 p-4 bg-red-900/30 border border-red-500 rounded-lg text-red-300">
-          <p>❌ Error: {error}</p>
+          <p>❌ {t.errorTitle}: {error}</p>
         </div>
       )}
 
@@ -128,12 +172,12 @@ export default function SearchInterface() {
               {response.mode === 'precise' ? (
                 <>
                   <Target size={20} className="text-green-400" />
-                  <span className="text-green-400 font-semibold">📍 Precise Answer</span>
+                  <span className="text-green-400 font-semibold">📍 {t.preciseMode}</span>
                 </>
               ) : (
                 <>
                   <Brain size={20} className="text-purple-400" />
-                  <span className="text-purple-400 font-semibold">🧠 Analyzed Response</span>
+                  <span className="text-purple-400 font-semibold">🧠 {t.analyzedMode}</span>
                 </>
               )}
             </div>
@@ -148,7 +192,7 @@ export default function SearchInterface() {
           {response.sources && response.sources.length > 0 && (
             <div className="bg-gray-900 rounded-lg border border-gray-700 p-6">
               <h3 className="text-lg font-semibold mb-4 text-gray-200">
-                📚 Sources ({response.sources.length})
+                📚 {t.sources} ({response.sources.length})
               </h3>
               <div className="space-y-3">
                 {response.sources.map((source: any, index: number) => (
@@ -159,7 +203,7 @@ export default function SearchInterface() {
                       </span>
                       {source.page && (
                         <span className="text-sm text-gray-400">
-                          Page {source.page}
+                          {t.page} {source.page}
                         </span>
                       )}
                     </div>
