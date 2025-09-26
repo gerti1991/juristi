@@ -116,6 +116,7 @@ def main():
         if args.force_reprocess:
             logger.info("🗑️ Force reprocessing requested - clearing existing embeddings...")
             rag_system._clear_incompatible_vectorstore()
+            rag_system._reset_document_index()
         
         # Process documents
         logger.info("📚 Processing documents for embeddings...")

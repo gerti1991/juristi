@@ -58,8 +58,8 @@ except ImportError:
 from dotenv import load_dotenv
 import streamlit as st
 
-# Load environment variables
-load_dotenv()
+# Load environment variables (force reload to get latest .env changes)
+load_dotenv(override=True)
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -276,46 +276,14 @@ class AlbanianLegalRAG:
             )
             
             # Create custom prompt template for Albanian legal questions (UI-only mode)
-            custom_prompt_template = """Ti jeni një ekspert i lartë juridik për legjislacionin shqiptar me përvojë profesionale në interpretimin e dokumenteve ligjore. Detyra juaj është të jepni përgjigje të sakta dhe profesionale.
-
-**UDHËZIME TË DETYRUESHME KRITIKE:**
-
-**HAPI 1 - IDENTIFIKIMI I DOKUMENTIT TË SAKTË:**
-- PARA çdo gjëje tjetër, IDENTIFIKONI emrin e saktë të dokumentit në çdo burim
-- KËRKONI emrin e ligjit/kodit që përmendet në pyetje (p.sh. "Kodi i Familjes")
-- KONTROLLONI që burimi të përmbajë dokumentin e kërkuar
-
-**HAPI 2 - FILTRIMI I BURIMEVE:**
-- Nëse pyetja kërkon një ligj specifik, IGNORONI të gjitha borimet që NUK janë nga ai ligj
-- KËRKONI vetëm në dokumentet që PËRPUTHEN me ligjin e kërkuar
-- MOS përdorni informacion nga ligje të tjera nëse kërkohet një ligj specifik
-
-**HAPI 3 - PËRGJIGJA PROFESIONALE:**
+            custom_prompt_template = """Ti jeni një ekspert i lartë juridik për legjislacionin shqiptar. Jepni përgjigje të sakta dhe profesionale.
 
 **PYETJA:** {question}
 
-**TË GJITHA DOKUMENTET E DISPONUESHME:**
+**DOKUMENTET LIGJORE:**
 {context}
 
-**ANALIZA E DETYRUAR:**
-
-1. **Identifikimi i Burimit të Saktë:**
-   - Cili është ligji/kodi i kërkuar nga pyetja?
-   - Cilat dokumente në kontekst përmbajnë këtë ligj?
-   - A ekziston informacioni i kërkuar në ligjin e duhur?
-
-2. **Përgjigja bazuar në analizë:**
-
-Nëse GJENI informacionin në ligjin e kërkuar:
-"✅ **PËRGJIGJA E SAKTË NGA [Emri i Ligjit të Kërkuar]:** [Informacioni i plotë]"
-
-Nëse informacioni NGJASJON të ekzistojë por nga një ligj tjetër:
-"⚠️ **KUJDES - LIGJ I GABUAR:** Gjeta informacion për [detajet], por është nga [Ligji Aktual], jo nga [Ligji i Kërkuar]. Informacioni i gabuar: [detajet]"
-
-Nëse NUK gjeni fare informacionin në ligjin e kërkuar:
-"❌ **INFORMACION I PAGJETUR:** Në [Ligji i Kërkuar] nuk gjej informacion për [detajet e pyetjes]. Ka mundësi që ky informacion të mos ekzistojë në këtë ligj."
-
-**CITIMI I DETYRUAR:** Emri i saktë i dokumentit + neni + faqja."""
+**PËRGJIGJA:** Jepni një përgjigje të drejtpërdrejtë duke cituar nenin dhe ligjin specifik."""
 
             custom_prompt = PromptTemplate(
                 template=custom_prompt_template,
@@ -348,19 +316,26 @@ Nëse NUK gjeni fare informacionin në ligjin e kërkuar:
         
         # Check if specific provider is requested via environment variable
         preferred_provider = os.getenv("EMBEDDING_PROVIDER", "google").lower()
+        if self.verbose:
+            logger.info(f"🔧 EMBEDDING_PROVIDER env var: '{os.getenv('EMBEDDING_PROVIDER', 'NOT_SET')}' -> preferred: '{preferred_provider}'")
         
         # Build the priority list dynamically
-        all_providers = ["google", "bge", "sentence-transformers"]
+        all_providers = ["google", "bge", "gemma", "sentence-transformers"]
+        
+        # Handle gemma as an alias for bge (Google Gemma uses BGE embeddings)
+        if preferred_provider == "gemma":
+            preferred_provider = "bge"
+        
         if preferred_provider in all_providers:
             # Start with the preferred provider
             embedding_providers = [preferred_provider]
-            # Add the rest as fallbacks
-            for p in all_providers:
+            # Add the rest as fallbacks (exclude gemma alias)
+            for p in ["google", "bge", "sentence-transformers"]:
                 if p != preferred_provider:
                     embedding_providers.append(p)
         else:
             # Default priority order if the preferred one is invalid
-            embedding_providers = all_providers
+            embedding_providers = ["google", "bge", "sentence-transformers"]
         
         for provider in embedding_providers:
             try:
@@ -623,46 +598,14 @@ Nëse NUK gjeni fare informacionin në ligjin e kërkuar:
             )
             
             # Create custom prompt template for Albanian legal questions
-            custom_prompt_template = """Ti jeni një ekspert i lartë juridik për legjislacionin shqiptar me përvojë profesionale në interpretimin e dokumenteve ligjore. Detyra juaj është të jepni përgjigje të sakta dhe profesionale.
-
-**UDHËZIME TË DETYRUESHME KRITIKE:**
-
-**HAPI 1 - IDENTIFIKIMI I DOKUMENTIT TË SAKTË:**
-- PARA çdo gjëje tjetër, IDENTIFIKONI emrin e saktë të dokumentit në çdo burim
-- KËRKONI emrin e ligjit/kodit që përmendet në pyetje (p.sh. "Kodi i Familjes")
-- KONTROLLONI që burimi të përmbajë dokumentin e kërkuar
-
-**HAPI 2 - FILTRIMI I BURIMEVE:**
-- Nëse pyetja kërkon një ligj specifik, IGNORONI të gjitha borimet që NUK janë nga ai ligj
-- KËRKONI vetëm në dokumentet që PËRPUTHEN me ligjin e kërkuar
-- MOS përdorni informacion nga ligje të tjera nëse kërkohet një ligj specifik
-
-**HAPI 3 - PËRGJIGJA PROFESIONALE:**
+            custom_prompt_template = """Ti jeni një ekspert i lartë juridik për legjislacionin shqiptar. Jepni përgjigje të sakta dhe profesionale.
 
 **PYETJA:** {question}
 
-**TË GJITHA DOKUMENTET E DISPONUESHME:**
+**DOKUMENTET LIGJORE:**
 {context}
 
-**ANALIZA E DETYRUAR:**
-
-1. **Identifikimi i Burimit të Saktë:**
-   - Cili është ligji/kodi i kërkuar nga pyetja?
-   - Cilat dokumente në kontekst përmbajnë këtë ligj?
-   - A ekziston informacioni i kërkuar në ligjin e duhur?
-
-2. **Përgjigja bazuar në analizë:**
-
-Nëse GJENI informacionin në ligjin e kërkuar:
-"✅ **PËRGJIGJA E SAKTË NGA [Emri i Ligjit të Kërkuar]:** [Informacioni i plotë]"
-
-Nëse informacioni NGJASJON të ekzistojë por nga një ligj tjetër:
-"⚠️ **KUJDES - LIGJ I GABUAR:** Gjeta informacion për [detajet], por është nga [Ligji Aktual], jo nga [Ligji i Kërkuar]. Informacioni i gabuar: [detajet]"
-
-Nëse NUK gjeni fare informacionin në ligjin e kërkuar:
-"❌ **INFORMACION I PAGJETUR:** Në [Ligji i Kërkuar] nuk gjej informacion për [detajet e pyetjes]. Ka mundësi që ky informacion të mos ekzistojë në këtë ligj."
-
-**CITIMI I DETYRUAR:** Emri i saktë i dokumentit + neni + faqja."""
+**PËRGJIGJA:** Jepni një përgjigje të drejtpërdrejtë duke cituar nenin dhe ligjin specifik."""
 
             custom_prompt = PromptTemplate(
                 template=custom_prompt_template,
@@ -1524,33 +1467,14 @@ Nëse NUK gjeni fare informacionin në ligjin e kërkuar:
         documents = [doc for doc, score in docs]
         
         # Create comprehensive analysis prompt
-        analyzed_prompt_template = """Ti jeni një ekspert i lartë juridik shqiptar me përvojë të gjerë në analizën e rasteve komplekse ligjore. Detyra juaj është të analizoni pyetjen e dhënë duke kombinuar informacione nga disa burime ligjore dhe të jepni një përgjigje të detajuar dhe të analizuar.
-
-**ANALIZA E DETYRUAR - MËNYRË ANALITIKE:**
-
-1. **Identifikimi i Elementeve Ligjorë:**
-   - Identifikoni të gjitha elementet e ndryshme ligjore të përfshira në pyetje
-   - Ndani pyetjen në pjesë më të vogla për analizë sistematike
-
-2. **Kombinimi i Informacioneve:**
-   - Kombinoni informacione nga burime të ndryshme ligjore
-   - Bëni llogaritje dhe analizë kur është e nevojshme
-   - Konsideroni rrethanat përkeqësuese dhe zbutëse
-
-3. **Përgjigja e Analizuar:**
-   - Jepni një përgjigje të detajuar që kombinon elementet e ndryshëm
-   - Përmendni të gjitha ligjet/kodet e përfshira
-   - Bëni llogaritje specifike kur pyetja kërkon (p.sh., total vite burgimi)
-   - Citoni burimet specifike për çdo element
-
-**KËRKESA E VEÇANTË:** Kur shkruani numra, përdorni fjalët në vend të shifrave (p.sh., "një" në vend të "1", "dy" në vend të "2").
+        analyzed_prompt_template = """Ti jeni një ekspert i lartë juridik shqiptar. Analizoni pyetjen dhe jepni një përgjigje të detajuar.
 
 **KONTEKSTI LIGJOR:**
 {context}
 
 **PYETJA:** {question}
 
-**PËRGJIGJA E ANALIZUAR (në shqip):**"""
+**PËRGJIGJA E ANALIZUAR:** Jepni një përgjigje të plotë dhe të detajuar në shqip."""
 
         # Create analyzed prompt
         analyzed_prompt = PromptTemplate(
